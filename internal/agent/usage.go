@@ -37,6 +37,14 @@ func (u *Usage) add(o Usage) {
 	u.CostUSD += o.CostUSD
 }
 
+// Plus é a soma de dois gastos, sem mexer em nenhum dos dois. Publicar um
+// review depois de produzi-lo é o mesmo card gastando duas vezes, e o número
+// que ele mostra tem de ser o das duas.
+func (u Usage) Plus(o Usage) Usage {
+	u.add(o)
+	return u
+}
+
 // String é o gasto em uma linha, do jeito que ele aparece no fim do review.
 func (u Usage) String() string {
 	if u.Empty() {

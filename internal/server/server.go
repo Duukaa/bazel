@@ -490,9 +490,10 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, view)
 }
 
-// handlePublish manda o agente publicar no PR o review que o usuário leu.
-// Vira um job novo — com passos e log — porque é outro agente rodando, e não
-// uma chamada de API que o Bazel resolve sozinho.
+// handlePublish manda o agente publicar no PR o review que o usuário leu. Roda
+// no card do próprio review — com passo e log próprios, porque é outro agente
+// rodando — e não num job à parte: publicar é o fim do review, não um trabalho
+// solto na fila.
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	view, err := s.jobs.PublishWithAgent(r.PathValue("id"))
 	if err != nil {

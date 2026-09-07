@@ -74,9 +74,15 @@ type Job struct {
 	Steps   []jobStep
 	Cloning bool
 
-	// publish, quando preenchido, faz deste job uma publicação: em vez de
-	// revisar, o agente pega o review já lido e o põe no PR.
-	publish *publishInput
+	// publish, quando preenchido, diz que este job está levando um review ao
+	// PR em vez de produzir um: o agente pega o review já lido e o põe lá.
+	// Acontece de duas formas — no card do próprio review, depois de o
+	// usuário lê-lo (pubChoice é o agente de post e stepBase diz onde os
+	// passos dele entram em Steps), ou num card só dele, quando o review veio
+	// do disco e não há job de origem nenhum.
+	publish   *publishInput
+	pubChoice config.Choice
+	stepBase  int
 
 	// logs é a janela do que os agentes escreveram; logSeq é o próximo
 	// número de linha e dropped conta o que já saiu pela frente da janela.
@@ -116,9 +122,12 @@ func (j *Job) duration() time.Duration {
 type publishInput struct {
 	Path string
 	Body string
-	// From é o id do job que produziu o review, para a página ligar os dois.
-	From string
 }
+
+// inPlacePublish diz que a publicação está rodando dentro do card do review
+// que a originou: os passos do agente de post vêm depois dos do review, e o
+// que ele escreve não substitui o review que está na tela.
+func (j *Job) inPlacePublish() bool { return j.publish != nil && j.stepBase > 0 }
 
 // Manager é a fila de reviews e o pool que a consome.
 type Manager struct {
@@ -264,11 +273,22 @@ func (m *Manager) run(job *Job) {
 		err error
 	)
 	if job.publish != nil {
-		res, err = m.runner.Publish(ctx, job.PR, job.Choice, job.publish.Path, job.publish.Body, onEvent)
+		res, err = m.runner.Publish(ctx, job.PR, job.pubChoice, job.publish.Path, job.publish.Body, onEvent)
 	} else {
 		res, err = m.runner.Review(ctx, job.PR, job.Choice, onEvent)
 	}
 	if err != nil {
+		// Publicando dentro do card do review, quem falhou foi a publicação:
+		// o review continua lido, salvo e publicável de novo, e apagá-lo da
+		// tela custaria justamente o que o usuário quer.
+		if job.inPlacePublish() {
+			msg := err.Error()
+			if ctx.Err() != nil {
+				msg = "publishing canceled"
+			}
+			m.failPublish(job, msg)
+			return
+		}
 		state := StateFailed
 		if ctx.Err() != nil {
 			state = StateCanceled
@@ -296,8 +316,19 @@ func (m *Manager) run(job *Job) {
 	}
 
 	m.mu.Lock()
-	job.Result = res
-	job.SavedTo = path
+	if job.inPlacePublish() {
+		// O relatório do agente de post não toma o lugar do review: o card
+		// continua mostrando o que o usuário leu, agora marcado como
+		// publicado e com o gasto das duas rodadas somado.
+		job.Posted = true
+		job.PostErr = ""
+		job.Result.Usage = job.Result.Usage.Plus(res.Usage)
+		job.publish = nil
+		job.Live = agent.Usage{}
+	} else {
+		job.Result = res
+		job.SavedTo = path
+	}
 	if saveErr != nil {
 		job.Err = "review done, but I could not save it to disk: " + saveErr.Error()
 	}
@@ -309,6 +340,33 @@ func (m *Manager) run(job *Job) {
 	m.publish(job)
 }
 
+// failPublish devolve ao card o review que ele já tinha: a publicação falhou
+// ou foi cancelada, mas o review continua na tela, salvo em disco e publicável
+// de novo. Os passos do agente de post ficam como estão — é neles que se vê
+// onde a publicação quebrou.
+func (m *Manager) failPublish(job *Job, msg string) {
+	m.mu.Lock()
+	m.failPublishLocked(job, msg)
+	m.mu.Unlock()
+	m.publish(job)
+}
+
+// failPublishLocked é o failPublish para quem já está com o lock na mão.
+func (m *Manager) failPublishLocked(job *Job, msg string) {
+	for i := job.stepBase; i < len(job.Steps); i++ {
+		if st := &job.Steps[i]; st.State == StateQueued || st.State == StateRunning {
+			st.State = StateFailed
+		}
+	}
+	job.PostErr = msg
+	job.publish = nil
+	job.Live = agent.Usage{}
+	job.State = StateDone
+	job.FinishedAt = time.Now()
+	job.Cloning = false
+	job.cancel = nil
+}
+
 // applyEvent registra o andamento de um passo e avisa os navegadores. É
 // chamada da goroutine do runner, então mexe no job sob o lock e só publica
 // depois de soltá-lo.
@@ -318,7 +376,7 @@ func (m *Manager) applyEvent(job *Job, e agent.Event) {
 	// aberto. O navegador busca o log incrementalmente em /api/jobs/{id}/log.
 	if e.Kind == agent.EventLog {
 		m.mu.Lock()
-		job.appendLog(e.Index, e.Agent, e.Stream, e.Text)
+		job.appendLog(e.Index+job.stepBase, e.Agent, e.Stream, e.Text)
 		m.mu.Unlock()
 		return
 	}
@@ -344,17 +402,21 @@ func (m *Manager) applyEvent(job *Job, e agent.Event) {
 	}
 
 	m.mu.Lock()
+	// O runner conta os passos da rodada dele a partir do zero; publicando
+	// dentro do card do review, essa rodada começa depois dos passos que já
+	// estão lá — stepBase é o que põe o evento na linha certa.
+	i := e.Index + job.stepBase
 	switch {
 	case e.Kind == agent.EventClone:
 		job.Cloning = true
-	case e.Index < 0 || e.Index >= len(job.Steps):
+	case e.Index < 0 || i >= len(job.Steps):
 		// Evento de um passo que não existe: nada a mostrar.
 	case e.Kind == agent.EventStep:
 		job.Cloning = false
-		job.Steps[e.Index].State = StateRunning
-		job.Steps[e.Index].StartedAt = time.Now()
+		job.Steps[i].State = StateRunning
+		job.Steps[i].StartedAt = time.Now()
 	case e.Kind == agent.EventStepDone:
-		st := &job.Steps[e.Index]
+		st := &job.Steps[i]
 		st.Duration = e.Duration
 		st.State = StateDone
 		if e.Err != nil {
@@ -471,6 +533,15 @@ func (m *Manager) Cancel(id string) error {
 	}
 	switch job.State {
 	case StateQueued:
+		// Cancelar uma publicação que espera na fila não cancela o review que
+		// já está no card: ele volta a ser um review terminado. O worker vê o
+		// estado mudado e nem chega a rodar o agente de post.
+		if job.inPlacePublish() {
+			m.failPublishLocked(job, "publishing canceled")
+			m.mu.Unlock()
+			m.publish(job)
+			return nil
+		}
 		job.State = StateCanceled
 		job.FinishedAt = time.Now()
 		m.mu.Unlock()
@@ -489,64 +560,68 @@ func (m *Manager) Cancel(id string) error {
 	}
 }
 
-// PublishWithAgent enfileira um job que leva ao PR um review já pronto — o que
-// o usuário acabou de ler. É o outro caminho para o GitHub: o comentário
-// simples do Post é o Bazel escrevendo; este é o agente publicando um review
-// com comentários inline.
+// PublishWithAgent manda o agente de post levar ao PR o review que o usuário
+// acabou de ler. É o outro caminho para o GitHub: o comentário simples do Post
+// é o Bazel escrevendo; este é o agente publicando um review com comentários
+// inline.
+//
+// Roda no card do próprio review: os passos do agente de post entram depois
+// dos do review e o card volta a rodar. Publicar não é um trabalho à parte —
+// é o fim do review — e um segundo card só espalharia o mesmo PR por dois
+// lugares da fila.
 func (m *Manager) PublishWithAgent(id string) (jobView, error) {
 	m.mu.Lock()
-	src, ok := m.jobs[id]
+	job, ok := m.jobs[id]
 	if !ok {
 		m.mu.Unlock()
 		return jobView{}, fmt.Errorf("job %q does not exist", id)
 	}
-	if src.State != StateDone {
+	// Já publicando: devolve o card como está, em vez de mandar o agente de
+	// post ao mesmo PR duas vezes.
+	if job.publish != nil && (job.State == StateQueued || job.State == StateRunning) {
+		v := job.view(false)
+		m.mu.Unlock()
+		return v, nil
+	}
+	if job.State != StateDone {
 		m.mu.Unlock()
 		return jobView{}, errors.New("that review has not finished")
 	}
-	if src.publish != nil {
-		m.mu.Unlock()
-		return jobView{}, errors.New("that one is already a publication")
-	}
-	if src.SavedTo == "" {
+	if job.SavedTo == "" {
 		m.mu.Unlock()
 		return jobView{}, errors.New("that review was not saved to disk — there is nothing to publish")
 	}
-	// Já publicando este mesmo review: devolve o job que está em curso.
-	for _, other := range m.order {
-		j := m.jobs[other]
-		if j.publish != nil && j.publish.From == id && (j.State == StateQueued || j.State == StateRunning) {
-			v := j.view(false)
-			m.mu.Unlock()
-			return v, nil
-		}
+	choice := m.cfg.PostChoice()
+	if len(choice.Steps) == 0 {
+		m.mu.Unlock()
+		return jobView{}, config.ErrNoAgents
 	}
 
-	choice := m.cfg.PostChoice()
-	m.seq++
-	job := &Job{
-		ID:     fmt.Sprintf("j%d", m.seq),
-		PR:     src.PR,
-		Mine:   src.Mine,
-		Choice: choice,
-		Steps:  []jobStep{{Name: choice.Steps[0].Name, State: StateQueued}},
-		publish: &publishInput{
-			Path: src.SavedTo,
-			Body: src.Result.Body,
-			From: id,
-		},
-		State:    StateQueued,
-		QueuedAt: time.Now(),
+	// Uma publicação anterior que falhou deixou os passos dela no card; a
+	// tentativa nova os refaz, não os empilha.
+	if job.stepBase > 0 {
+		job.Steps = job.Steps[:job.stepBase]
+	} else {
+		job.stepBase = len(job.Steps)
 	}
-	m.jobs[job.ID] = job
-	m.order = append(m.order, job.ID)
-	m.trimLocked()
+	for _, name := range choice.StepNames() {
+		job.Steps = append(job.Steps, jobStep{Name: name, State: StateQueued})
+	}
+	job.publish = &publishInput{Path: job.SavedTo, Body: job.Result.Body}
+	job.pubChoice = choice
+	job.State = StateQueued
+	job.QueuedAt = time.Now()
+	job.StartedAt = time.Time{}
+	job.FinishedAt = time.Time{}
+	job.Err = ""
+	job.PostErr = ""
+	job.Live = agent.Usage{}
 	m.mu.Unlock()
 
 	select {
 	case m.queue <- job:
 	default:
-		m.finish(job, StateFailed, "queue is full — wait for the reviews in flight")
+		m.failPublish(job, "queue is full — wait for the reviews in flight")
 		return m.mustView(job.ID), errors.New("queue is full")
 	}
 	m.publish(job)
@@ -575,14 +650,15 @@ func (m *Manager) PublishSaved(pr gh.PR, mine bool, path, body string) (jobView,
 	choice := m.cfg.PostChoice()
 	m.seq++
 	job := &Job{
-		ID:       fmt.Sprintf("j%d", m.seq),
-		PR:       pr,
-		Mine:     mine,
-		Choice:   choice,
-		Steps:    []jobStep{{Name: choice.Steps[0].Name, State: StateQueued}},
-		publish:  &publishInput{Path: path, Body: body},
-		State:    StateQueued,
-		QueuedAt: time.Now(),
+		ID:        fmt.Sprintf("j%d", m.seq),
+		PR:        pr,
+		Mine:      mine,
+		Choice:    choice,
+		Steps:     []jobStep{{Name: choice.Steps[0].Name, State: StateQueued}},
+		publish:   &publishInput{Path: path, Body: body},
+		pubChoice: choice,
+		State:     StateQueued,
+		QueuedAt:  time.Now(),
 	}
 	m.jobs[job.ID] = job
 	m.order = append(m.order, job.ID)

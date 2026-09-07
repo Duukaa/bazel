@@ -98,10 +98,10 @@ type jobView struct {
 	Agent    string `json:"agent,omitempty"`
 	Pipeline bool   `json:"pipeline,omitempty"`
 	Posts    bool   `json:"posts,omitempty"`
-	// Publishing marca o job que está levando um review já lido ao PR, e
-	// PublishOf aponta para o review de onde ele saiu.
+	// Publishing marca o job que está levando ao PR um review já lido — o
+	// card do próprio review enquanto o agente de post roda, ou o card de uma
+	// publicação vinda do disco.
 	Publishing bool       `json:"publishing,omitempty"`
-	PublishOf  string     `json:"publish_of,omitempty"`
 	LogLines   int        `json:"log_lines"`
 	Steps      []stepView `json:"steps,omitempty"`
 	Cloning    bool       `json:"cloning,omitempty"`
@@ -151,15 +151,20 @@ func (j *Job) view(withBody bool) jobView {
 		HasBody:   j.Result.Body != "",
 	}
 	// Terminado, quem manda é o gasto fechado do resultado; antes disso, o
-	// parcial que o agente vai reportando.
-	if used := j.Result.Usage; !used.Empty() {
-		v.Tokens, v.Cost = used.Total(), used.CostUSD
-	} else if !j.Live.Empty() {
+	// parcial que o agente vai reportando. Publicando dentro do card do
+	// review, os dois valem: o fechado do review mais o que o agente de post
+	// já queimou.
+	switch fechado := j.Result.Usage; {
+	case !fechado.Empty() && j.publish != nil && !j.Live.Empty():
+		soma := fechado.Plus(j.Live)
+		v.Tokens, v.Cost, v.Partial = soma.Total(), soma.CostUSD, true
+	case !fechado.Empty():
+		v.Tokens, v.Cost = fechado.Total(), fechado.CostUSD
+	case !j.Live.Empty():
 		v.Tokens, v.Cost, v.Partial = j.Live.Total(), j.Live.CostUSD, true
 	}
 	if j.publish != nil {
 		v.Publishing = true
-		v.PublishOf = j.publish.From
 	}
 	if !j.StartedAt.IsZero() {
 		t := j.StartedAt

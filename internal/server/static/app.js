@@ -359,10 +359,13 @@ async function cancelJob(id) {
 // publishJob manda o agente publicar o review que está na tela. É o caminho
 // "li e aprovei": diferente do postJob, que é o Bazel colando o markdown como
 // comentário, aqui roda a skill de post e o review sai com inline.
+//
+// A publicação acontece neste mesmo card — o card volta a rodar com o passo do
+// agente de post no fim — e não num segundo card na fila.
 async function publishJob(id, btn) {
   const job = state.jobs.find((j) => j.id === id);
   if (!job) return;
-  if (!confirm(`Publish this review on ${job.pr.key} with inline comments?\n\nThe agent runs again, only to publish what you have just read.`)) return;
+  if (!confirm(`Publish this review on ${job.pr.key} with inline comments?\n\nThe post agent runs in this same card, publishing what you have just read.`)) return;
   if (btn) { btn.disabled = true; btn.textContent = 'publishing…'; }
   try {
     const view = await api(`/api/jobs/${encodeURIComponent(id)}/publish`, { method: 'POST' });
@@ -997,7 +1000,7 @@ function renderJobs() {
         actions.append(p);
       }
       if (job.posted) {
-        actions.append(el('span', 'state done', '✓ commented'));
+        actions.append(el('span', 'state done', '✓ published'));
       } else {
         const b = el('button', 'btn small ghost', 'comment');
         b.title = 'pastes the review as a single comment, no agent';
@@ -1134,7 +1137,7 @@ function renderViewer() {
   }
   if (job.state === 'running') {
     v.append(el('p', 'dim', job.publishing
-      ? 'publishing the review you read — cloning the PR and commenting line by line.'
+      ? 'publishing the review you read — cloning the PR and commenting line by line. The review comes back to this card when it is done.'
       : 'running inside the PR clone. You can close the tab, the review keeps going.'));
     v.append(stepsBox(job));
     const custo = gasto(job);
@@ -1179,7 +1182,7 @@ function renderViewer() {
     pub.addEventListener('click', () => publishJob(job.id, pub));
     bar.append(pub);
     if (job.posted) {
-      bar.append(el('span', 'state done', '✓ already commented on the PR'));
+      bar.append(el('span', 'state done', '✓ already on the PR'));
     } else {
       const cm = el('button', 'btn ghost', 'or paste as a comment');
       cm.addEventListener('click', () => postJob(job.id, cm));

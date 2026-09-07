@@ -306,8 +306,11 @@ click **publish inline review**. That runs the `post_agent` — the `post-report
 skill — over a clone of the PR, with the markdown file you just read in the
 prompt and the instruction **not to redo the review**: it publishes what is in
 the file, with inline comments on the right lines, 👍 on what is already flagged
-in the PR, and an all-clear when there is nothing to say. It becomes a job like
-any other, with steps and a log.
+in the PR, and an all-clear when there is nothing to say. It runs **in the
+review's own card** — the card goes back to running with the post agent's step
+at the end of the list, log and all, and comes back to the review, now marked
+`✓ published`, when it finishes. Publishing is the end of a review, not a second
+job in the queue.
 
 **2. Paste as a comment** ("or paste as a comment"). This is Bazel writing,
 with no agent: the review markdown becomes a single comment, immediately. No

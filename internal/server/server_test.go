@@ -174,9 +174,9 @@ func TestPipelineJobReportsEveryStep(t *testing.T) {
 	}
 }
 
-// Publicar é um job novo, com o agente de post e o review já salvo em mãos —
-// e o review original continua lá, do jeito que o usuário leu.
-func TestPublishWithAgentQueuesPostJob(t *testing.T) {
+// Publicar acontece no card do próprio review: o mesmo job volta a rodar com o
+// passo do agente de post no fim, e o review que o usuário leu continua lá.
+func TestPublishWithAgentRunsInTheSameJob(t *testing.T) {
 	dir := t.TempDir()
 	cfg := cfgFor(t, "cat")
 	semClone := false
@@ -203,42 +203,71 @@ func TestPublishWithAgentQueuesPostJob(t *testing.T) {
 	if done.SavedTo == "" {
 		t.Fatal("review sem arquivo salvo")
 	}
+	corpo, _ := m.View(review.ID, true)
 
 	pub, err := m.PublishWithAgent(review.ID)
 	if err != nil {
 		t.Fatalf("PublishWithAgent: %v", err)
 	}
-	if pub.ID == review.ID {
-		t.Fatal("publicar devia virar um job novo")
+	if pub.ID != review.ID {
+		t.Fatalf("publicar devia rodar no card do review: %s virou %s", review.ID, pub.ID)
 	}
-	if !pub.Publishing || pub.PublishOf != review.ID {
-		t.Errorf("o job de publicação devia apontar para o review: %+v", pub)
+	if !pub.Publishing {
+		t.Errorf("o card devia estar publicando: %+v", pub)
 	}
-	if pub.Agent != "post-report" {
-		t.Errorf("devia rodar o agente de post, roda %q", pub.Agent)
+	if pub.Agent != cfg.DefaultChoice().Name {
+		t.Errorf("o card continua sendo o do review, agente %q", pub.Agent)
+	}
+	if len(pub.Steps) != len(done.Steps)+1 {
+		t.Fatalf("esperava o passo do post depois dos %d do review, vieram %d",
+			len(done.Steps), len(pub.Steps))
+	}
+	if last := pub.Steps[len(pub.Steps)-1]; last.Name != "post-report" {
+		t.Errorf("o último passo devia ser o agente de post, é %q", last.Name)
 	}
 
-	// Pedir de novo enquanto roda não abre um segundo.
+	// Pedir de novo enquanto roda não abre um segundo card nem republica.
 	again, err := m.PublishWithAgent(review.ID)
 	if err != nil {
 		t.Fatalf("PublishWithAgent (2): %v", err)
 	}
-	if again.ID != pub.ID {
-		t.Errorf("publicação duplicada: %s e %s", pub.ID, again.ID)
+	if again.ID != pub.ID || len(again.Steps) != len(pub.Steps) {
+		t.Errorf("publicação duplicada: %+v", again)
 	}
 
-	end := waitFor(t, ch, pub.ID, StateDone)
-	// O prompt do post levou o caminho do review lido.
-	full, _ := m.View(pub.ID, true)
-	if !strings.Contains(full.Body, done.SavedTo) {
-		t.Errorf("o agente de post não recebeu o arquivo do review:\n%s", full.Body)
+	end := waitFor(t, ch, review.ID, StateDone)
+	if !end.Posted || end.PostErr != "" {
+		t.Errorf("o card devia terminar publicado: posted=%v err=%q", end.Posted, end.PostErr)
 	}
-	// E a publicação não gerou um segundo .md.
-	if end.SavedTo != "" {
-		t.Errorf("publicação não devia salvar arquivo, salvou %q", end.SavedTo)
+	if end.Publishing {
+		t.Error("terminada a publicação, o card volta a ser o do review")
 	}
-	// Só um .md no diretório: o índice de revisados mora ali do lado, mas
-	// publicar não escreve um segundo review.
+	// O review continua sendo o que o card mostra — o relatório do agente de
+	// post não toma o lugar dele.
+	full, _ := m.View(review.ID, true)
+	if full.Body != corpo.Body {
+		t.Errorf("o review na tela mudou depois de publicar:\n%s", full.Body)
+	}
+	if full.SavedTo != done.SavedTo {
+		t.Errorf("o arquivo do review devia continuar %q, virou %q", done.SavedTo, full.SavedTo)
+	}
+	// E o agente de post recebeu o caminho do review: o `cat` devolve o
+	// prompt que leu, e ele sai no log do passo da publicação.
+	log, ok := m.Log(review.ID, 0)
+	if !ok {
+		t.Fatal("sem log")
+	}
+	var viuArquivo bool
+	for _, l := range log.Lines {
+		if l.Step == len(pub.Steps)-1 && strings.Contains(l.Text, done.SavedTo) {
+			viuArquivo = true
+		}
+	}
+	if !viuArquivo {
+		t.Errorf("o agente de post não recebeu o arquivo do review: %+v", log.Lines)
+	}
+	// E a publicação não gerou um segundo .md: o índice de revisados mora
+	// naquele diretório, mas publicar não escreve outro review.
 	files, _ := os.ReadDir(dir)
 	var mds int
 	for _, f := range files {

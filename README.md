@@ -316,6 +316,16 @@ job in the queue.
 with no agent: the review markdown becomes a single comment, immediately. No
 inline anchors, but no agent spend either.
 
+**Leaving a false positive behind.** Every finding on screen — each `###`
+under `## Findings` or `## Cuts`, or each `**1. …**` paragraph in reports that
+number their findings in bold instead — carries a **report** checkbox, ticked
+by default. Untick the ones you disagree with and they drop out of whatever you
+publish next, on both paths above: the inline publish hands the post agent a
+copy of the review without them (written to `publish/` inside the reviews
+directory, the saved file stays whole), and the pasted comment simply omits
+them. The line next to the buttons says how many go and how many stay, with
+**all** / **none** shortcuts.
+
 **3. Publish directly**, skipping your reading: pick an agent marked `⇧` in the
 selector before reviewing — the one you created with **⇧ publishes**. It reviews
 and publishes in the same pass.

@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"net"
 	"net/http"
@@ -482,7 +483,12 @@ func (s *Server) handleCancel(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
-	view, err := s.jobs.Post(r.Context(), r.PathValue("id"))
+	skip, err := readSkip(w, r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	view, err := s.jobs.Post(r.Context(), r.PathValue("id"), skip)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
@@ -495,7 +501,12 @@ func (s *Server) handlePost(w http.ResponseWriter, r *http.Request) {
 // rodando — e não num job à parte: publicar é o fim do review, não um trabalho
 // solto na fila.
 func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
-	view, err := s.jobs.PublishWithAgent(r.PathValue("id"))
+	skip, err := readSkip(w, r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	view, err := s.jobs.PublishWithAgent(r.PathValue("id"), skip)
 	if err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
@@ -731,7 +742,7 @@ func (s *Server) handleSavedOne(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"name": r.PathValue("name"),
 		"body": body,
-		"html": renderMarkdown(body),
+		"html": renderReview(store.Unwrap(body)),
 	})
 }
 
@@ -762,12 +773,17 @@ func (s *Server) savedPR(ctx context.Context, name string) (gh.PR, string, strin
 
 // handleSavedPublish roda o agente de publicação sobre um review salvo.
 func (s *Server) handleSavedPublish(w http.ResponseWriter, r *http.Request) {
+	skip, err := readSkip(w, r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
 	pr, path, body, err := s.savedPR(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	view, err := s.jobs.PublishSaved(pr, strings.EqualFold(pr.Author.Login, s.me), path, body)
+	view, err := s.jobs.PublishSaved(pr, strings.EqualFold(pr.Author.Login, s.me), path, body, skip)
 	if err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
@@ -777,12 +793,17 @@ func (s *Server) handleSavedPublish(w http.ResponseWriter, r *http.Request) {
 
 // handleSavedComment cola um review salvo no PR, sem agente.
 func (s *Server) handleSavedComment(w http.ResponseWriter, r *http.Request) {
+	skip, err := readSkip(w, r)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
 	pr, _, body, err := s.savedPR(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.jobs.CommentSaved(r.Context(), pr, body); err != nil {
+	if err := s.jobs.CommentSaved(r.Context(), pr, body, skip); err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
@@ -791,6 +812,26 @@ func (s *Server) handleSavedComment(w http.ResponseWriter, r *http.Request) {
 }
 
 // --- helpers ---
+
+// readSkip lê, do corpo de um pedido de publicação, os achados que o usuário
+// desmarcou na tela — os índices que o renderReview numerou. Corpo vazio é
+// "publica tudo": os quatro caminhos para o PR aceitam a lista e nenhum a
+// exige.
+func readSkip(w http.ResponseWriter, r *http.Request) ([]int, error) {
+	var req struct {
+		Skip []int `json:"skip"`
+	}
+	err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return nil, fmt.Errorf("invalid body: %w", err)
+	}
+	for _, i := range req.Skip {
+		if i < 0 {
+			return nil, fmt.Errorf("invalid finding index %d", i)
+		}
+	}
+	return req.Skip, nil
+}
 
 func (s *Server) jobViews() []jobView {
 	return s.jobs.Snapshot()

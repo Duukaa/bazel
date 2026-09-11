@@ -26,6 +26,7 @@ const state = {
   activeSaved: null,
   activePR: null,      // chave do PR aberto no painel da direita
   bodies: {},        // id do job -> html do review
+  picks: {},         // 'job:<id>' | 'saved:<name>' -> Set dos achados desmarcados
   logs: {},          // id do job -> {next, lines, dropped, live, busy}
 };
 
@@ -193,6 +194,7 @@ function dropJob(id) {
   state.jobs = state.jobs.filter((j) => j.id !== id);
   if (state.jobs.length === antes) return;
   delete state.bodies[id];
+  delete state.picks[pickKey('job', id)];
   delete state.logs[id];
   if (state.activeJob === id) {
     state.activeJob = null;
@@ -365,10 +367,11 @@ async function cancelJob(id) {
 async function publishJob(id, btn) {
   const job = state.jobs.find((j) => j.id === id);
   if (!job) return;
-  if (!confirm(`Publish this review on ${job.pr.key} with inline comments?\n\nThe post agent runs in this same card, publishing what you have just read.`)) return;
+  const skip = skipList(pickKey('job', id));
+  if (!confirm(`Publish this review on ${job.pr.key} with inline comments?\n\nThe post agent runs in this same card, publishing what you have just read.${skipNote(skip)}`)) return;
   if (btn) { btn.disabled = true; btn.textContent = 'publishing…'; }
   try {
-    const view = await api(`/api/jobs/${encodeURIComponent(id)}/publish`, { method: 'POST' });
+    const view = await api(`/api/jobs/${encodeURIComponent(id)}/publish`, { method: 'POST', body: JSON.stringify({ skip }) });
     upsertJob(view);
     state.activeJob = view.id;
     state.tab = 'queue';
@@ -383,13 +386,14 @@ async function publishJob(id, btn) {
 async function postJob(id, btn) {
   const job = state.jobs.find((j) => j.id === id);
   if (!job) return;
+  const skip = skipList(pickKey('job', id));
   const aviso = job.posts
     ? `The agent "${job.agent}" already published this review on ${job.pr.key}. Publish it again, as a comment?`
     : `Publish this review as a comment on ${job.pr.key}?`;
-  if (!confirm(aviso)) return;
+  if (!confirm(aviso + skipNote(skip))) return;
   if (btn) { btn.disabled = true; btn.textContent = 'publishing…'; }
   try {
-    upsertJob(await api(`/api/jobs/${encodeURIComponent(id)}/post`, { method: 'POST' }));
+    upsertJob(await api(`/api/jobs/${encodeURIComponent(id)}/post`, { method: 'POST', body: JSON.stringify({ skip }) }));
   } catch (err) {
     banner('failed to publish: ' + err.message);
     if (btn) { btn.disabled = false; btn.textContent = 'publish to the PR'; }
@@ -425,6 +429,8 @@ async function openSaved(name) {
     const md = el('div', 'md');
     md.innerHTML = data.html;
     v.append(md);
+    const key = pickKey('saved', name);
+    const total = decorateFindings(md, key);
 
     // Um review salvo continua publicável: fechar o Bazel antes de mandá-lo
     // ao PR não pode custar o trabalho do agente.
@@ -438,6 +444,7 @@ async function openSaved(name) {
       cm.title = `pastes this review as a single comment on ${entry.repo}#${entry.number}`;
       cm.addEventListener('click', () => commentSaved(name, cm));
       bar.append(pub, cm);
+      if (total) bar.append(pickSummary(key, total));
       v.append(bar);
     }
     v.scrollTop = 0;
@@ -451,10 +458,11 @@ async function openSaved(name) {
 async function publishSaved(name, btn) {
   const entry = state.saved.find((x) => x.name === name);
   const alvo = entry ? `${entry.repo}#${entry.number}` : 'the PR';
-  if (!confirm(`Publish this saved review on ${alvo} with inline comments?\n\nThe agent runs to publish what is in the file — it does not review again.`)) return;
+  const skip = skipList(pickKey('saved', name));
+  if (!confirm(`Publish this saved review on ${alvo} with inline comments?\n\nThe agent runs to publish what is in the file — it does not review again.${skipNote(skip)}`)) return;
   btn.disabled = true;
   try {
-    const job = await api('/api/reviews/' + encodeURIComponent(name) + '/publish', { method: 'POST' });
+    const job = await api('/api/reviews/' + encodeURIComponent(name) + '/publish', { method: 'POST', body: JSON.stringify({ skip }) });
     upsertJob(job);
     state.tab = 'queue';
     state.activeJob = job.id;
@@ -472,12 +480,13 @@ async function publishSaved(name, btn) {
 async function commentSaved(name, btn) {
   const entry = state.saved.find((x) => x.name === name);
   const alvo = entry ? `${entry.repo}#${entry.number}` : 'the PR';
-  if (!confirm(`Paste this saved review as a comment on ${alvo}?`)) return;
+  const skip = skipList(pickKey('saved', name));
+  if (!confirm(`Paste this saved review as a comment on ${alvo}?` + skipNote(skip))) return;
   btn.disabled = true;
   const antes = btn.textContent;
   btn.textContent = 'publishing…';
   try {
-    await api('/api/reviews/' + encodeURIComponent(name) + '/comment', { method: 'POST' });
+    await api('/api/reviews/' + encodeURIComponent(name) + '/comment', { method: 'POST', body: JSON.stringify({ skip }) });
     btn.textContent = '✓ commented on ' + alvo;
     loadPRs(false);
   } catch (err) {
@@ -485,6 +494,89 @@ async function commentSaved(name, btn) {
     btn.disabled = false;
     btn.textContent = antes;
   }
+}
+
+// --- a caixa de cada achado ---
+//
+// Cada achado do review chega do servidor numa <section class="finding"
+// data-finding="N">. A caixa é a decisão de levá-lo ao PR: desmarcada, o
+// achado sai do que qualquer um dos botões de publicar manda — é assim que um
+// falso positivo fica para trás sem ninguém editar o markdown. O N é o mesmo
+// índice que o servidor usa para cortar, e a escolha vive em state.picks
+// para sobreviver ao redesenho do painel.
+const pickKey = (kind, id) => kind + ':' + id;
+
+function skipped(key) {
+  if (!state.picks[key]) state.picks[key] = new Set();
+  return state.picks[key];
+}
+
+const skipList = (key) => [...skipped(key)].sort((a, b) => a - b);
+
+// skipNote é o lembrete no confirm de publicar: o que ficou desmarcado não vai.
+function skipNote(skip) {
+  if (!skip.length) return '';
+  return `\n\n${skip.length} unticked finding${skip.length === 1 ? '' : 's'} will be left out.`;
+}
+
+// decorateFindings põe a caixa em cada achado do review desenhado em md e
+// devolve quantos achados há.
+function decorateFindings(md, key) {
+  const secs = md.querySelectorAll('section.finding');
+  const out = skipped(key);
+  secs.forEach((sec) => {
+    const idx = Number(sec.dataset.finding);
+    const label = el('label', 'finding-pick');
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.checked = !out.has(idx);
+    box.title = 'untick to leave this finding out of what goes to the PR';
+    label.append(box, el('span', null, 'report'));
+    sec.classList.toggle('skipped', out.has(idx));
+    box.addEventListener('change', () => {
+      if (box.checked) out.delete(idx); else out.add(idx);
+      sec.classList.toggle('skipped', !box.checked);
+      refreshPickSummary();
+    });
+    sec.prepend(label);
+  });
+  return secs.length;
+}
+
+// pickSummary é a linha ao lado dos botões de publicar: quantos achados vão,
+// quantos ficam, e os atalhos para marcar ou desmarcar todos de uma vez.
+function pickSummary(key, total) {
+  const s = el('span', 'pick-summary');
+  s.dataset.key = key;
+  s.dataset.total = total;
+  const txt = el('span', 'dim');
+  const all = el('button', 'btn small ghost', 'all');
+  all.title = 'tick every finding';
+  const none = el('button', 'btn small ghost', 'none');
+  none.title = 'untick every finding';
+  const setAll = (on) => {
+    document.querySelectorAll('#viewer section.finding input[type=checkbox]').forEach((box) => {
+      if (box.checked !== on) { box.checked = on; box.dispatchEvent(new Event('change')); }
+    });
+  };
+  all.addEventListener('click', () => setAll(true));
+  none.addEventListener('click', () => setAll(false));
+  s.append(txt, all, none);
+  refreshPickSummary(s);
+  return s;
+}
+
+function refreshPickSummary(s = document.querySelector('#viewer .pick-summary')) {
+  if (!s) return;
+  const total = Number(s.dataset.total);
+  const out = skipped(s.dataset.key).size;
+  const kept = total - out;
+  const txt = s.firstChild;
+  if (!out) txt.textContent = `${total} finding${total === 1 ? '' : 's'} · all ticked`;
+  else if (!kept) txt.textContent = `all ${total} findings unticked — only the rest of the review goes out`;
+  else txt.textContent = `${kept} of ${total} findings ticked · ${out} left out`;
+  s.children[1].disabled = !out;
+  s.children[2].disabled = !kept;
 }
 
 // --- render ---
@@ -1169,6 +1261,8 @@ function renderViewer() {
   const md = el('div', 'md');
   md.innerHTML = html;
   v.append(md);
+  const key = pickKey('job', job.id);
+  const total = decorateFindings(md, key);
 
   if (job.steps && job.steps.length > 1) v.append(stepsBox(job));
   if (job.log_lines) v.append(logPanel(job, false));
@@ -1188,6 +1282,7 @@ function renderViewer() {
       cm.addEventListener('click', () => postJob(job.id, cm));
       bar.append(cm);
     }
+    if (total) bar.append(pickSummary(key, total));
     v.append(bar);
   }
 

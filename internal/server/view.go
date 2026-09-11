@@ -176,7 +176,7 @@ func (j *Job) view(withBody bool) jobView {
 	}
 	if withBody && j.Result.Body != "" {
 		v.Body = j.Result.Body
-		v.HTML = renderMarkdown(j.Result.Body)
+		v.HTML = renderReview(j.Result.Body)
 	}
 	return v
 }

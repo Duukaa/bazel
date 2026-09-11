@@ -190,9 +190,9 @@ func PRFromTitle(title string) (string, int) {
 // Save escreveu — é o texto que o agente produziu, e é ele que vai ao PR.
 func ReviewBody(file string) string {
 	if _, corpo, ok := strings.Cut(file, "\n---\n"); ok {
-		return strings.TrimSpace(corpo)
+		return strings.TrimSpace(Unwrap(corpo))
 	}
-	return strings.TrimSpace(file)
+	return strings.TrimSpace(Unwrap(file))
 }
 
 func heading(path string) string {

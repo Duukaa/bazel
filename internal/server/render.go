@@ -2,7 +2,11 @@ package server
 
 import (
 	"bytes"
+	"fmt"
 	"html"
+	"strings"
+
+	"github.com/beroni/bazel/internal/store"
 
 	"github.com/microcosm-cc/bluemonday"
 	"github.com/yuin/goldmark"
@@ -41,4 +45,31 @@ func renderMarkdown(src string) string {
 		return "<pre>" + html.EscapeString(src) + "</pre>"
 	}
 	return string(policy.SanitizeBytes(buf.Bytes()))
+}
+
+// renderReview converte um review em HTML com cada achado embrulhado numa
+// <section class="finding" data-finding="N">. A página põe a caixa de
+// marcar em cada uma, e o N é o mesmo índice que o publish recebe em `skip`
+// — os dois lados cortam o markdown com o mesmo store.SplitFindings, então
+// a caixa desmarcada na tela é exatamente o bloco que sai do que vai ao PR.
+//
+// O embrulho fica fora da sanitização: é HTML nosso, não do agente.
+func renderReview(body string) string {
+	parts := store.SplitFindings(body)
+	if len(parts) <= 1 {
+		return renderMarkdown(body)
+	}
+	var b strings.Builder
+	idx := 0
+	for _, p := range parts {
+		if !p.Finding {
+			b.WriteString(renderMarkdown(p.Text))
+			continue
+		}
+		fmt.Fprintf(&b, `<section class="finding" data-finding="%d">`, idx)
+		b.WriteString(renderMarkdown(p.Text))
+		b.WriteString("</section>")
+		idx++
+	}
+	return b.String()
 }

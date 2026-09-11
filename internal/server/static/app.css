@@ -371,6 +371,21 @@ main.no-prs .burger span { background: var(--accent); }
   margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--line);
 }
 
+/* A caixa de cada achado: desmarcada, ele fica para trás na publicação.
+   O que apaga é o conteúdo, não a caixa — é ela que traz o achado de volta. */
+.finding { margin-top: 22px; padding-left: 14px; border-left: 2px solid var(--line); }
+.finding > h3 { margin-top: 4px; }
+.finding-pick {
+  display: flex; align-items: center; gap: 6px; width: fit-content;
+  font-size: 12px; color: var(--dim); cursor: pointer; user-select: none;
+}
+.finding-pick input { accent-color: var(--accent); margin: 0; }
+.finding-pick:hover { color: var(--accent); }
+.finding.skipped { border-left-color: transparent; }
+.finding.skipped > :not(.finding-pick) { opacity: .4; }
+.finding.skipped > h3, .finding.skipped > p:first-of-type > strong:first-child { text-decoration: line-through; }
+.pick-summary { display: flex; align-items: center; gap: 8px; font-size: 12px; margin-left: auto; }
+
 /* --- agentes e skills na configuração --- */
 .agent-list { display: flex; flex-direction: column; gap: 10px; margin-bottom: 8px; }
 .agent-row { border: 1px solid var(--line); border-radius: 6px; padding: 9px 11px; background: var(--panel-2); }

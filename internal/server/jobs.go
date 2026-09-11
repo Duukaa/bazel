@@ -124,6 +124,22 @@ type publishInput struct {
 	Body string
 }
 
+// publishInputFor monta o que o agente de post recebe. Sem achado desmarcado
+// é o review como está; com algum, o corpo perde esses achados e o agente
+// ganha uma cópia do arquivo já sem eles em publish/, porque a skill de post
+// lê o arquivo, não o prompt.
+func (m *Manager) publishInputFor(path, body string, skip []int) (*publishInput, error) {
+	if len(skip) == 0 {
+		return &publishInput{Path: path, Body: body}, nil
+	}
+	body = store.DropFindings(body, skip)
+	copyPath, err := store.SavePublishCopy(m.reviewsDir, path, body)
+	if err != nil {
+		return nil, fmt.Errorf("could not write the review without the unticked findings: %w", err)
+	}
+	return &publishInput{Path: copyPath, Body: body}, nil
+}
+
 // inPlacePublish diz que a publicação está rodando dentro do card do review
 // que a originou: os passos do agente de post vêm depois dos do review, e o
 // que ele escreve não substitui o review que está na tela.
@@ -304,6 +320,9 @@ func (m *Manager) run(job *Job) {
 		saveErr error
 	)
 	if job.publish == nil {
+		// Relatório colado num bloco ```markdown sai do bloco antes de ir
+		// à tela, ao disco e ao PR — dentro dele nada renderiza.
+		res.Body = store.Unwrap(res.Body)
 		path, saveErr = store.Save(m.reviewsDir, res)
 	}
 
@@ -569,7 +588,11 @@ func (m *Manager) Cancel(id string) error {
 // dos do review e o card volta a rodar. Publicar não é um trabalho à parte —
 // é o fim do review — e um segundo card só espalharia o mesmo PR por dois
 // lugares da fila.
-func (m *Manager) PublishWithAgent(id string) (jobView, error) {
+//
+// skip são os achados que o usuário desmarcou na tela: eles saem do que vai
+// ao PR, e o agente recebe uma cópia do review sem eles — o arquivo salvo
+// continua inteiro.
+func (m *Manager) PublishWithAgent(id string, skip []int) (jobView, error) {
 	m.mu.Lock()
 	job, ok := m.jobs[id]
 	if !ok {
@@ -596,6 +619,11 @@ func (m *Manager) PublishWithAgent(id string) (jobView, error) {
 		m.mu.Unlock()
 		return jobView{}, config.ErrNoAgents
 	}
+	in, err := m.publishInputFor(job.SavedTo, job.Result.Body, skip)
+	if err != nil {
+		m.mu.Unlock()
+		return jobView{}, err
+	}
 
 	// Uma publicação anterior que falhou deixou os passos dela no card; a
 	// tentativa nova os refaz, não os empilha.
@@ -607,7 +635,7 @@ func (m *Manager) PublishWithAgent(id string) (jobView, error) {
 	for _, name := range choice.StepNames() {
 		job.Steps = append(job.Steps, jobStep{Name: name, State: StateQueued})
 	}
-	job.publish = &publishInput{Path: job.SavedTo, Body: job.Result.Body}
+	job.publish = in
 	job.pubChoice = choice
 	job.State = StateQueued
 	job.QueuedAt = time.Now()
@@ -632,9 +660,13 @@ func (m *Manager) PublishWithAgent(id string) (jobView, error) {
 // anterior, aberto na aba dos salvos. É o mesmo caminho do PublishWithAgent,
 // mas partindo do arquivo: um review sobrevive ao servidor, e a chance de
 // publicá-lo tem de sobreviver junto.
-func (m *Manager) PublishSaved(pr gh.PR, mine bool, path, body string) (jobView, error) {
+func (m *Manager) PublishSaved(pr gh.PR, mine bool, path, body string, skip []int) (jobView, error) {
 	if strings.TrimSpace(path) == "" {
 		return jobView{}, errors.New("no review file to publish")
+	}
+	in, err := m.publishInputFor(path, body, skip)
+	if err != nil {
+		return jobView{}, err
 	}
 	m.mu.Lock()
 	// Já publicando este mesmo arquivo: devolve o job que está em curso.
@@ -655,7 +687,7 @@ func (m *Manager) PublishSaved(pr gh.PR, mine bool, path, body string) (jobView,
 		Mine:      mine,
 		Choice:    choice,
 		Steps:     []jobStep{{Name: choice.Steps[0].Name, State: StateQueued}},
-		publish:   &publishInput{Path: path, Body: body},
+		publish:   in,
 		pubChoice: choice,
 		State:     StateQueued,
 		QueuedAt:  time.Now(),
@@ -677,7 +709,8 @@ func (m *Manager) PublishSaved(pr gh.PR, mine bool, path, body string) (jobView,
 
 // CommentSaved cola no PR um review que está em disco, sem agente nenhum. É o
 // caminho barato do arquivo para o GitHub.
-func (m *Manager) CommentSaved(ctx context.Context, pr gh.PR, body string) error {
+func (m *Manager) CommentSaved(ctx context.Context, pr gh.PR, body string, skip []int) error {
+	body = store.DropFindings(body, skip)
 	if strings.TrimSpace(body) == "" {
 		return errors.New("that review has no body to publish")
 	}
@@ -688,8 +721,8 @@ func (m *Manager) CommentSaved(ctx context.Context, pr gh.PR, body string) error
 	return err
 }
 
-// Post publica o review como comentário no PR.
-func (m *Manager) Post(ctx context.Context, id string) (jobView, error) {
+// Post publica o review como comentário no PR, sem os achados em skip.
+func (m *Manager) Post(ctx context.Context, id string, skip []int) (jobView, error) {
 	m.mu.Lock()
 	job, ok := m.jobs[id]
 	if !ok {
@@ -705,6 +738,7 @@ func (m *Manager) Post(ctx context.Context, id string) (jobView, error) {
 		return jobView{}, fmt.Errorf("that review was already published")
 	}
 	res := job.Result
+	res.Body = store.DropFindings(res.Body, skip)
 	m.mu.Unlock()
 
 	err := gh.Comment(ctx, res.PR.Repo, res.PR.Number, store.CommentBody(res))

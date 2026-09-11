@@ -205,7 +205,7 @@ func TestPublishWithAgentRunsInTheSameJob(t *testing.T) {
 	}
 	corpo, _ := m.View(review.ID, true)
 
-	pub, err := m.PublishWithAgent(review.ID)
+	pub, err := m.PublishWithAgent(review.ID, nil)
 	if err != nil {
 		t.Fatalf("PublishWithAgent: %v", err)
 	}
@@ -227,7 +227,7 @@ func TestPublishWithAgentRunsInTheSameJob(t *testing.T) {
 	}
 
 	// Pedir de novo enquanto roda não abre um segundo card nem republica.
-	again, err := m.PublishWithAgent(review.ID)
+	again, err := m.PublishWithAgent(review.ID, nil)
 	if err != nil {
 		t.Fatalf("PublishWithAgent (2): %v", err)
 	}
@@ -333,10 +333,10 @@ func TestPublishWithAgentRefusesBadSources(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	if _, err := m.PublishWithAgent(view.ID); err == nil {
+	if _, err := m.PublishWithAgent(view.ID, nil); err == nil {
 		t.Error("review em andamento não devia poder ser publicado")
 	}
-	if _, err := m.PublishWithAgent("j999"); err == nil {
+	if _, err := m.PublishWithAgent("j999", nil); err == nil {
 		t.Error("job inexistente devia dar erro")
 	}
 }
@@ -987,7 +987,7 @@ func TestPublishSavedRodaSemJobDeOrigem(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	view, err := m.PublishSaved(testPR(482), false, path, "# Verdict\n\nAll good.")
+	view, err := m.PublishSaved(testPR(482), false, path, "# Verdict\n\nAll good.", nil)
 	if err != nil {
 		t.Fatalf("PublishSaved: %v", err)
 	}
@@ -997,7 +997,7 @@ func TestPublishSavedRodaSemJobDeOrigem(t *testing.T) {
 
 	// Pedir de novo enquanto o primeiro roda não abre um segundo: publicar
 	// duas vezes o mesmo arquivo é comentar duas vezes no PR.
-	again, err := m.PublishSaved(testPR(482), false, path, "# Verdict\n\nAll good.")
+	again, err := m.PublishSaved(testPR(482), false, path, "# Verdict\n\nAll good.", nil)
 	if err != nil {
 		t.Fatalf("PublishSaved de novo: %v", err)
 	}
@@ -1011,7 +1011,121 @@ func TestPublishSavedRodaSemJobDeOrigem(t *testing.T) {
 	if done.SavedTo != "" {
 		t.Errorf("uma publicação não devia salvar outro review: %q", done.SavedTo)
 	}
-	if _, err := m.PublishSaved(testPR(482), false, "", "corpo"); err == nil {
+	if _, err := m.PublishSaved(testPR(482), false, "", "corpo", nil); err == nil {
 		t.Error("sem arquivo não há o que publicar")
+	}
+}
+
+// Cada achado do review sai numa <section> numerada: é nela que a página põe
+// a caixa de marcar, e o número é o que o publish recebe em `skip`.
+func TestRenderReviewEmbrulhaOsAchados(t *testing.T) {
+	src := "# Report\n\n## Findings\n\n### One\n\ntext <script>x</script>\n\n### Two\n\nmore\n\n## Coverage\n\n- ok\n"
+	got := renderReview(src)
+	for _, want := range []string{`<section class="finding" data-finding="0"><h3>One</h3>`, `<section class="finding" data-finding="1"><h3>Two</h3>`, "<h2>Coverage</h2>"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("faltou %q:\n%s", want, got)
+		}
+	}
+	if strings.Count(got, "<section") != 2 || strings.Count(got, "</section>") != 2 {
+		t.Errorf("esperava duas sections:\n%s", got)
+	}
+	if strings.Contains(got, "<script") {
+		t.Error("o embrulho não pode pular a sanitização")
+	}
+	if plain := renderReview("just **text**"); plain != renderMarkdown("just **text**") {
+		t.Errorf("sem achado, é o render normal: %s", plain)
+	}
+}
+
+// Desmarcar um achado na tela tira só ele do que o agente de post recebe: o
+// arquivo salvo continua inteiro e a cópia cortada vai em publish/.
+func TestPublishWithAgentDeixaDeForaOsDesmarcados(t *testing.T) {
+	dir := t.TempDir()
+	// O `cat` devolve o prompt: o do review é o relatório com dois achados,
+	// e o do post é a task — que traz o caminho do arquivo que ele recebeu.
+	cfg := cfgFor(t, "cat")
+	cfg.Agent.Prompt = "## Findings\n\n### First\n\nreal bug\n\n### Second\n\nfalse positive\n"
+	semClone := false
+	cfg.PostAgent = config.AgentDef{Name: "post", Task: "publish {{review_file}}", Posts: true, Checkout: &semClone, Prompt: "{{task}}"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := NewHub()
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	m := NewManager(ctx, cfg, dir, 1, false, hub)
+	review, err := m.Enqueue(testPR(482), false, cfg.DefaultChoice())
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	done := waitFor(t, ch, review.ID, StateDone)
+	full, _ := m.View(review.ID, true)
+	if strings.Count(full.HTML, `class="finding"`) != 2 {
+		t.Fatalf("esperava dois achados embrulhados:\n%s", full.HTML)
+	}
+
+	if _, err := m.PublishWithAgent(review.ID, []int{1}); err != nil {
+		t.Fatalf("PublishWithAgent: %v", err)
+	}
+	end := waitFor(t, ch, review.ID, StateDone)
+	if !end.Posted {
+		t.Fatalf("devia ter publicado: %+v", end)
+	}
+	copia := filepath.Join(dir, "publish", filepath.Base(done.SavedTo))
+	data, err := os.ReadFile(copia)
+	if err != nil {
+		t.Fatalf("a cópia sem o achado devia estar em publish/: %v", err)
+	}
+	if strings.Contains(string(data), "false positive") || !strings.Contains(string(data), "real bug") {
+		t.Errorf("a cópia devia ter só o achado marcado:\n%s", data)
+	}
+	orig, _ := os.ReadFile(done.SavedTo)
+	if !strings.Contains(string(orig), "false positive") {
+		t.Error("o review salvo não devia perder o achado desmarcado")
+	}
+	// O agente recebeu a cópia, não o original.
+	log, _ := m.Log(review.ID, 0)
+	var viuCopia bool
+	for _, l := range log.Lines {
+		if strings.Contains(l.Text, copia) {
+			viuCopia = true
+		}
+	}
+	if !viuCopia {
+		t.Errorf("o agente de post devia receber %s: %+v", copia, log.Lines)
+	}
+	// E o review na tela continua inteiro.
+	after, _ := m.View(review.ID, true)
+	if after.Body != full.Body {
+		t.Error("o corpo do review na tela mudou")
+	}
+}
+
+// O corpo do pedido de publicação é opcional: vazio é "publica tudo", e um
+// índice negativo é recusado antes de chegar à fila.
+func TestReadSkipAceitaCorpoVazio(t *testing.T) {
+	for _, tc := range []struct {
+		body string
+		want []int
+		bad  bool
+	}{
+		{"", nil, false},
+		{`{}`, nil, false},
+		{`{"skip":[0,2]}`, []int{0, 2}, false},
+		{`{"skip":[-1]}`, nil, true},
+		{`nope`, nil, true},
+	} {
+		r := httptest.NewRequest("POST", "/x", strings.NewReader(tc.body))
+		got, err := readSkip(httptest.NewRecorder(), r)
+		if tc.bad {
+			if err == nil {
+				t.Errorf("%q devia falhar", tc.body)
+			}
+			continue
+		}
+		if err != nil || fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Errorf("%q: got %v, %v; queria %v", tc.body, got, err, tc.want)
+		}
 	}
 }

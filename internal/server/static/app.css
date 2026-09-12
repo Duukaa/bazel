@@ -422,19 +422,46 @@ main.no-prs .burger span { background: var(--accent); }
 .tokens { color: var(--dim); font-variant-numeric: tabular-nums; }
 .tokens-foot { margin-top: 6px; font-variant-numeric: tabular-nums; }
 
-/* --- montador de pipeline --- */
-.pipe-builder { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
-.pipe-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 28px;
-  padding: 7px 9px; border: 1px dashed var(--line); border-radius: 6px; }
-.pipe-step { display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px 2px 8px;
-  border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); font-size: 12px; }
-.pipe-step .n { color: var(--dim); font-size: 10px; }
-.pipe-step button { background: none; border: 0; color: var(--dim); cursor: pointer;
-  font-size: 12px; padding: 0 2px; line-height: 1; }
-.pipe-step button:hover { color: var(--fg); }
-.pipe-step button:disabled { opacity: .3; cursor: default; }
-.pipe-arrow { color: var(--dim); font-size: 11px; }
-.pipe-pick { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+/* --- montador de pipeline ---
+   A cadeia é um fluxo: cards ligados por setas, com uma fenda entre cada par.
+   A fenda é estreita até alguém arrastar algo por cima dela, e aí ela abre —
+   é o que mostra onde o passo vai cair antes de você soltar. */
+.pipe-builder { display: flex; flex-direction: column; gap: 10px; margin-bottom: 12px; }
+.pipe-flow {
+  display: flex; flex-wrap: wrap; align-items: stretch; gap: 2px; min-height: 56px;
+  padding: 10px; border: 1px dashed var(--line); border-radius: 8px; background: var(--bg);
+}
+.pipe-flow.empty { align-items: center; color: var(--dim); }
+
+.pipe-gap { width: 4px; border-radius: 3px; align-self: stretch; transition: width .1s, background .1s; }
+.pipe-gap.over { width: 26px; background: var(--accent); }
+
+.pipe-node {
+  display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; min-width: 96px;
+  border: 1px solid var(--line); border-radius: 7px; background: var(--panel-2);
+  font-size: 12px; cursor: grab; user-select: none;
+}
+.pipe-node:active { cursor: grabbing; }
+.pipe-node.dragging { opacity: .35; }
+.pipe-node.reserved { border-style: dashed; }
+.pipe-node.reserved .pipe-node-name { color: var(--warn); }
+.pipe-node-top { display: flex; align-items: center; gap: 6px; }
+.pipe-node-name { font-weight: 600; }
+.pipe-node .n {
+  color: var(--dim); font-size: 10px; border: 1px solid var(--line);
+  border-radius: 3px; padding: 0 4px; line-height: 1.5;
+}
+.pipe-node .x { margin-left: auto; background: none; border: 0; color: var(--dim); cursor: pointer;
+  font-size: 13px; padding: 0 1px; line-height: 1; }
+.pipe-node .x:hover { color: var(--err); }
+.pipe-node-note { color: var(--dim); font-size: 10.5px; }
+.pipe-arrow { align-self: center; color: var(--dim); font-size: 13px; padding: 0 1px; }
+
+.pipe-tray { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.pipe-tray .btn { cursor: grab; }
+.pipe-tray .btn:disabled { cursor: default; }
+.pipe-tray .btn.reserved { border-style: dashed; }
+.pipe-sep { color: var(--dim); padding: 0 2px; }
 .pipe-row { display: flex; gap: 8px; align-items: center; }
 .pipe-row input { flex: 1; min-width: 0; }
 
@@ -445,5 +472,4 @@ main.no-prs .burger span { background: var(--accent); }
 #config-raw pre { margin-top: 8px; }
 .state.paused { color: var(--warn); }
 .step.paused { color: var(--warn); }
-.pipe-step.reserved { border-style: dashed; color: var(--warn); }
 .pipe-sep { color: var(--dim); padding: 0 2px; }

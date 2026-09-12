@@ -470,9 +470,10 @@ the steps that already ran would be talking about another repository.
 While a pipeline is paused it holds no worker: other reviews keep running. Give
 up with **stop here** and what you read stays on screen; the clone goes.
 
-You build one in the page rather than here: under **pipelines** in the config
-dialog, click the agents in the order they should run, drag them around with
-`↑ ↓`, name it and create. Only agents already in the list can be steps — that
+You build one in the page rather than here: under **pipelines** on the config
+page, drag a step out of the tray into the chain and drag the cards to reorder
+them — clicking works the same, for when dragging is not worth it. Name it and
+create. Only agents already in the list can be steps — that
 is what guarantees each step arrives with its prompt, its command and its
 publishing flag already settled. The same agent twice in one sequence is refused:
 it would be the same work twice over the same clone. The rules around `pause` and

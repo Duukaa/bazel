@@ -1529,12 +1529,26 @@ async function agentAction(path, method, btn, body) {
   }
 }
 
-// renderPipelineBuilder monta a sequência: você escolhe os agentes na ordem em
-// que eles devem rodar sobre o mesmo clone, dá um nome e cria.
+// --- montador de pipeline ---
 //
-// Os passos são agentes da lista de cima, não skills soltas — é o que garante
-// que cada passo já tem prompt, comando e o tique de publicação resolvidos, e
-// é o que o servidor exige.
+// A sequência é uma cadeia de cards ligados por setas: você arrasta um agente
+// da bandeja para dentro dela, e arrasta um card para mudar a ordem. Os passos
+// são agentes da lista de cima, não skills soltas — é o que garante que cada
+// passo já tem prompt, comando e o tique de publicação resolvidos, e é o que o
+// servidor exige.
+//
+// O clique continua valendo em tudo que o arrastar faz: mouse preciso não pode
+// ser requisito para montar uma pipeline.
+
+// arrasto guarda o que está sendo arrastado. `from` é o índice na cadeia
+// quando é um card que já está lá; `add` é o nome quando vem da bandeja.
+let arrasto = null;
+// alvo é a posição onde o passo cairia, e é o que desenha a fenda aberta.
+let alvo = null;
+
+const RESERVADOS = ['pause', 'publish'];
+const ehReservado = (n) => RESERVADOS.includes(n);
+
 function renderPipelineBuilder() {
   const box = $('#pipeline-builder');
   box.innerHTML = '';
@@ -1550,97 +1564,159 @@ function renderPipelineBuilder() {
   // Agente removido lá em cima não pode continuar no rascunho daqui. Os passos
   // reservados ficam: eles não dependem da lista.
   state.pipeSteps = state.pipeSteps.filter((n) =>
-    n === 'pause' || n === 'publish' || disponiveis.some((a) => a.name === n));
+    ehReservado(n) || disponiveis.some((a) => a.name === n));
 
-  const passos = el('div', 'pipe-steps');
-  if (!state.pipeSteps.length) {
-    passos.append(el('span', 'dim', 'no step yet — pick the agents below, in the order they should run'));
-  }
+  box.append(cadeia(), bandeja(disponiveis), linhaDeCriar());
+}
+
+// cadeia é a sequência montada: cards e setas, e as fendas entre eles onde um
+// passo arrastado cai.
+function cadeia() {
+  const fluxo = el('div', 'pipe-flow');
+  if (!state.pipeSteps.length) fluxo.classList.add('empty');
+
+  const solta = (i) => {
+    const z = el('div', 'pipe-gap' + (alvo === i ? ' over' : ''));
+    z.addEventListener('dragover', (e) => {
+      if (!arrasto) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = arrasto.add ? 'copy' : 'move';
+      if (alvo !== i) { alvo = i; renderPipelineBuilder(); }
+    });
+    z.addEventListener('drop', (e) => { e.preventDefault(); solte(i); });
+    return z;
+  };
+
+  fluxo.append(solta(0));
   state.pipeSteps.forEach((nome, i) => {
-    if (i > 0) passos.append(el('span', 'pipe-arrow', '→'));
-    const reservado = nome === 'pause' || nome === 'publish';
-    const chip = el('span', 'pipe-step' + (reservado ? ' reserved' : ''));
-    chip.append(el('span', 'n', i + 1), document.createTextNode(nome === 'pause' ? '⏸ pause' : nome));
+    if (i > 0) fluxo.append(el('span', 'pipe-arrow', '→'));
+    fluxo.append(no(nome, i));
+    fluxo.append(solta(i + 1));
+  });
+  if (!state.pipeSteps.length) {
+    fluxo.append(el('span', 'dim', 'drag an agent in here, or click one below'));
+  }
+  return fluxo;
+}
 
-    const mover = (de, para) => {
-      const [x] = state.pipeSteps.splice(de, 1);
-      state.pipeSteps.splice(para, 0, x);
-      renderPipelineBuilder();
-    };
-    const sobe = el('button', null, '↑');
-    sobe.title = 'run this one earlier';
-    sobe.disabled = i === 0;
-    sobe.addEventListener('click', () => mover(i, i - 1));
-    const desce = el('button', null, '↓');
-    desce.title = 'run this one later';
-    desce.disabled = i === state.pipeSteps.length - 1;
-    desce.addEventListener('click', () => mover(i, i + 1));
-    const tira = el('button', null, '×');
-    tira.title = 'take this step out';
-    tira.addEventListener('click', () => {
-      state.pipeSteps.splice(i, 1);
+// no é um passo na cadeia: o card arrastável, com o número da ordem e o que
+// ele é. O × tira; arrastar move.
+function no(nome, i) {
+  const card = el('div', 'pipe-node' + (ehReservado(nome) ? ' reserved' : '')
+    + (arrasto && arrasto.from === i ? ' dragging' : ''));
+  card.draggable = true;
+  card.title = 'drag to move this step';
+
+  const topo = el('div', 'pipe-node-top');
+  topo.append(el('span', 'n', String(i + 1)));
+  topo.append(el('span', 'pipe-node-name', nome === 'pause' ? '⏸ pause' : nome));
+  const tira = el('button', 'x', '×');
+  tira.title = 'take this step out';
+  tira.draggable = false;
+  tira.addEventListener('click', () => {
+    state.pipeSteps.splice(i, 1);
+    renderPipelineBuilder();
+  });
+  topo.append(tira);
+  card.append(topo);
+
+  const a = state.agents.find((x) => x.name === nome);
+  const nota = nome === 'pause' ? 'waits for you'
+    : nome === 'publish' ? 'goes to the PR'
+    : a && a.publishable === false ? 'stays here' : '';
+  if (nota) card.append(el('div', 'pipe-node-note', nota));
+
+  card.addEventListener('dragstart', (e) => {
+    arrasto = { from: i };
+    e.dataTransfer.effectAllowed = 'move';
+    // Firefox só começa o arrasto se houver dado no dataTransfer.
+    e.dataTransfer.setData('text/plain', nome);
+    setTimeout(renderPipelineBuilder, 0);
+  });
+  card.addEventListener('dragend', () => { arrasto = null; alvo = null; renderPipelineBuilder(); });
+  return card;
+}
+
+// bandeja são os passos que dá para acrescentar: os agentes da lista e os dois
+// que o Bazel executa por conta própria.
+function bandeja(disponiveis) {
+  const box = el('div', 'pipe-tray');
+  const fechada = state.pipeSteps.includes('publish');
+
+  const item = (nome, rotulo, dica, porque) => {
+    const b = el('button', 'btn small ghost' + (ehReservado(nome) ? ' reserved' : ''), rotulo);
+    if (porque) {
+      b.disabled = true;
+      b.title = porque;
+      box.append(b);
+      return;
+    }
+    b.title = dica;
+    b.draggable = true;
+    b.addEventListener('dragstart', (e) => {
+      arrasto = { add: nome };
+      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.setData('text/plain', nome);
+    });
+    b.addEventListener('dragend', () => { arrasto = null; alvo = null; renderPipelineBuilder(); });
+    // Clicar acrescenta no fim: é o caminho de quem não quer arrastar.
+    b.addEventListener('click', () => {
+      state.pipeSteps.push(nome);
       renderPipelineBuilder();
     });
-    chip.append(sobe, desce, tira);
-    passos.append(chip);
-  });
-  box.append(passos);
+    box.append(b);
+  };
 
-  const escolher = el('div', 'pipe-pick');
-  // Publicar é o fim da linha: depois dele a pipeline está fechada, e revisar
-  // mais deixaria em disco um review diferente do que o time acabou de ler.
-  const fechada = state.pipeSteps.includes('publish');
   for (const a of disponiveis) {
-    const b = el('button', 'btn small ghost', '+ ' + a.name);
-    if (fechada) {
-      b.disabled = true;
-      b.title = 'publish is the last step — nothing runs after it';
-    } else if (state.pipeSteps.includes(a.name)) {
-      // (passo reservado pode repetir; agente, não — é o mesmo trabalho duas
-      // vezes sobre o mesmo clone)
-      // O mesmo agente duas vezes seria o mesmo trabalho duas vezes sobre o
-      // mesmo clone — o servidor recusa, e aqui o botão nem convida.
-      b.disabled = true;
-      b.title = 'already a step in this pipeline';
-    } else {
-      b.title = a.description || `adds ${a.name} as the next step`;
-      b.addEventListener('click', () => {
-        state.pipeSteps.push(a.name);
-        renderPipelineBuilder();
-      });
-    }
-    escolher.append(b);
+    item(a.name, '+ ' + a.name, a.description || `adds ${a.name} as a step`,
+      fechada ? 'publish is the last step — nothing runs after it'
+        : state.pipeSteps.includes(a.name) ? 'already a step in this pipeline'
+        : '');
   }
 
-  // Os passos que o Bazel executa por conta própria. Valem as mesmas regras
-  // que o servidor aplica — desabilitar aqui é dizer o porquê antes, em vez de
-  // recusar depois.
+  box.append(el('span', 'pipe-sep', '·'));
+  // As mesmas regras que o servidor aplica — desabilitar aqui é dizer o porquê
+  // antes, em vez de recusar depois.
   const ultimo = state.pipeSteps[state.pipeSteps.length - 1];
-  const jaPublica = fechada;
-  const semAgente = !state.pipeSteps.some((n) => n !== 'pause' && n !== 'publish');
-  const addReservado = (nome, rotulo, dica) => {
-    const b = el('button', 'btn small ghost', rotulo);
-    let porque = '';
-    if (semAgente) porque = 'needs an agent before it — there would be nothing to show you yet';
-    else if (jaPublica) porque = 'publish is the last step — nothing runs after it';
-    else if (nome === 'pause' && ultimo === 'pause') porque = 'two pauses in a row run nothing between them';
-    else if (nome === 'publish' && !state.pipeSteps.some((n) => {
-      const a = state.agents.find((x) => x.name === n);
-      return a && a.publishable !== false;
-    })) porque = 'nothing before it produces a review that can go to the PR';
-    if (porque) { b.disabled = true; b.title = porque; }
-    else {
-      b.title = dica;
-      b.addEventListener('click', () => { state.pipeSteps.push(nome); renderPipelineBuilder(); });
-    }
-    escolher.append(b);
-  };
-  escolher.append(el('span', 'pipe-sep', '·'));
-  addReservado('pause', '+ ⏸ pause', 'stops here and waits for you to read what came out before the rest runs');
-  addReservado('publish', '+ publish', 'takes the report to the PR with the publishing agent — put it after a pause');
+  const semAgente = !state.pipeSteps.some((n) => !ehReservado(n));
+  const nadaPublicavel = !state.pipeSteps.some((n) => {
+    const a = state.agents.find((x) => x.name === n);
+    return a && a.publishable !== false;
+  });
+  item('pause', '+ ⏸ pause', 'stops here and waits for you to read what came out before the rest runs',
+    semAgente ? 'needs an agent before it — there would be nothing to show you yet'
+      : fechada ? 'publish is the last step — nothing runs after it'
+      : ultimo === 'pause' ? 'two pauses in a row run nothing between them'
+      : '');
+  item('publish', '+ publish', 'takes the report to the PR with the publishing agent — put it after a pause',
+    semAgente ? 'needs an agent before it — there would be nothing to publish yet'
+      : fechada ? 'a pipeline publishes at most once'
+      : nadaPublicavel ? 'nothing before it produces a review that can go to the PR'
+      : '');
+  return box;
+}
 
-  box.append(escolher);
+// solte aplica o arrasto: mover um card de lugar, ou trazer um passo novo da
+// bandeja para a posição em que ele foi largado.
+function solte(pos) {
+  if (!arrasto) return;
+  if (arrasto.add) {
+    state.pipeSteps.splice(pos, 0, arrasto.add);
+  } else {
+    const de = arrasto.from;
+    const [x] = state.pipeSteps.splice(de, 1);
+    // Tirar o card antes de inserir encurta a cadeia: uma posição depois dele
+    // já não é mais a mesma.
+    state.pipeSteps.splice(de < pos ? pos - 1 : pos, 0, x);
+  }
+  arrasto = null;
+  alvo = null;
+  renderPipelineBuilder();
+}
 
+// linhaDeCriar é o nome e o botão. O botão diz o que impede, em vez de só
+// ficar apagado.
+function linhaDeCriar() {
   const linha = el('div', 'pipe-row');
   const nome = el('input');
   nome.type = 'text';
@@ -1648,14 +1724,17 @@ function renderPipelineBuilder() {
   nome.autocomplete = 'off';
   nome.value = state.pipeName || '';
   nome.addEventListener('input', () => { state.pipeName = nome.value; });
+
   const criar = el('button', 'btn primary', 'create pipeline');
-  const agentesEscolhidos = state.pipeSteps.filter((n) => n !== 'pause' && n !== 'publish').length;
+  const agentes = state.pipeSteps.filter((n) => !ehReservado(n)).length;
+  const ultimo = state.pipeSteps[state.pipeSteps.length - 1];
   let impede = '';
-  if (!agentesEscolhidos) impede = 'a pipeline needs at least one agent';
-  else if (agentesEscolhidos < 2 && state.pipeSteps.length < 2) impede = 'a pipeline chains two agents or more, or one agent and a step of its own';
+  if (!agentes) impede = 'a pipeline needs at least one agent';
+  else if (agentes < 2 && state.pipeSteps.length < 2) impede = 'a pipeline chains two agents or more, or one agent and a step of its own';
   else if (ultimo === 'pause') impede = 'a pause at the end has nothing to continue into — add a step after it, or drop the pause';
   criar.disabled = !!impede;
   criar.title = impede || 'creates the sequence and puts it in the selector';
+
   const enviar = async () => {
     const n = (state.pipeName || '').trim();
     if (!n) { banner('give the pipeline a name.'); nome.focus(); return; }
@@ -1670,7 +1749,7 @@ function renderPipelineBuilder() {
   criar.addEventListener('click', enviar);
   nome.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); enviar(); } });
   linha.append(nome, criar);
-  box.append(linha);
+  return linha;
 }
 
 // renderSkillList mostra o que está instalado de fato — a lista que manda, e

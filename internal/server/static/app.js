@@ -236,7 +236,7 @@ async function reviewRefs(refs) {
     const alvo = refs.length > 1 ? `${refs.length} PRs` : refs[0];
     if (!confirm(`The agent "${chosen.name}" publishes the review straight to ${alvo}. Run it anyway?`)) return;
   }
-  $('#review').disabled = true;
+  $('#run').disabled = true;
   try {
     const res = await api('/api/reviews', { method: 'POST', body: JSON.stringify({ refs, agent: state.agent }) });
     (res.jobs || []).forEach(upsertJob);
@@ -297,9 +297,7 @@ function openPR(key) {
   for (const t of reviewTags(pr)) sub.append(t);
   grow.append(h, sub);
 
-  const act = el('button', 'btn primary', 'review this PR');
-  act.addEventListener('click', () => reviewRefs([pr.key]));
-  head.append(grow, act);
+  head.append(grow);
   v.append(head);
 
   if (pr.changed_since_review) {
@@ -958,13 +956,13 @@ function toggle(key, on) {
 
 function updateReviewButton() {
   const n = markedPRs().length;
-  const btn = $('#review');
+  const btn = $('#run');
   const semAgente = !selectableAgents().length;
   btn.disabled = n === 0 || semAgente;
   btn.title = semAgente
     ? 'no agents configured — open "config" and build the list out of your skills'
     : 'runs the chosen agent over the ticked PRs';
-  btn.textContent = n > 1 ? `review ${n}` : 'review';
+  btn.textContent = n > 1 ? `run ${n}` : 'run';
 }
 
 // togglePRs recolhe a lista da esquerda até a faixa do hambúrguer e a traz de
@@ -1308,7 +1306,7 @@ function renderViewer() {
 
 function wire() {
   $('#refresh').addEventListener('click', () => loadPRs(true));
-  $('#review').addEventListener('click', startReview);
+  $('#run').addEventListener('click', startReview);
   $('#agent').addEventListener('change', (e) => {
     state.agent = e.target.value;
     $('#agent').title = agentTitle(state.agent);

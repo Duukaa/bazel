@@ -52,7 +52,7 @@
       <label class="check"><input type="checkbox" id="select-all"> select all</label>
       <div class="spacer"></div>
       <select id="agent" title="which agent runs over the ticked PRs"></select>
-      <button class="btn primary" id="review" disabled>review</button>
+      <button class="btn primary" id="run" disabled>run</button>
     </div>
   </aside>
 
@@ -67,7 +67,7 @@
     <article id="viewer" class="viewer">
       <div class="placeholder">
         <img class="logo big" src="/static/bazelgeuse.webp" alt="" width="500" height="500">
-        <p>Tick a PR on the left, pick an agent and hit <b>review</b>.</p>
+        <p>Tick a PR on the left, pick an agent and hit <b>run</b>.</p>
         <p class="dim">The agent clones the repository, runs over the PR and the result shows up here.
         You can close the tab: the review keeps going on the server.</p>
         <p class="dim only-collapsed">The list is hidden — click the <b>☰</b> on the left edge to bring it back.</p>

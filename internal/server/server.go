@@ -99,8 +99,12 @@ func New(ctx context.Context, cfg *config.Config, me string, opts Options) (*Ser
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 
+	// Os assets vão com no-store, como o index. Eles estão embutidos no
+	// binário: atualizar o Bazel muda o js e o css, e um navegador servindo a
+	// versão anterior contra um servidor novo é um bug que não se reproduz na
+	// máquina de quem escreveu. Não há banda a economizar aqui — é loopback.
 	assets, _ := fs.Sub(staticFS, "static")
-	mux.Handle("GET /static/", http.StripPrefix("/static/", http.FileServer(http.FS(assets))))
+	mux.Handle("GET /static/", http.StripPrefix("/static/", semCache(http.FileServer(http.FS(assets)))))
 	mux.HandleFunc("GET /{$}", s.handleIndex)
 
 	mux.HandleFunc("GET /api/state", s.handleState)
@@ -134,6 +138,14 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/reviews/{name}/comment", s.handleSavedComment)
 
 	return s.guard(mux)
+}
+
+// semCache manda o navegador não guardar o que vem embutido no binário.
+func semCache(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Cache-Control", "no-store")
+		next.ServeHTTP(w, r)
+	})
 }
 
 // Run sobe o servidor e só volta quando o ctx morre.

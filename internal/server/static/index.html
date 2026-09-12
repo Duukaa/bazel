@@ -17,12 +17,15 @@
   <div class="spacer"></div>
   <div class="who" id="who"></div>
   <button class="btn" id="refresh" title="refresh the list from GitHub">refresh</button>
-  <button class="btn ghost" id="show-config" title="open the configuration">config</button>
+  <nav class="nav" id="nav">
+    <a href="#/" data-page="dashboard" class="on">dashboard</a>
+    <a href="#/config" data-page="config">config</a>
+  </nav>
 </header>
 
 <div id="banner" class="banner" hidden></div>
 
-<main>
+<main id="page-dashboard" class="page">
   <aside class="pane prs">
     <div class="pane-head">
       <div class="row">
@@ -76,10 +79,8 @@
   </section>
 </main>
 
-<div id="modal" class="modal" hidden>
-  <div class="modal-box">
-    <div class="modal-head"><b id="modal-title">configuration</b><button class="btn ghost" id="modal-close">close</button></div>
-    <div class="modal-body">
+<section id="page-config" class="page config" hidden>
+  <div class="config-body">
       <h3>watched repositories</h3>
       <div id="repo-list" class="repo-list"></div>
       <form class="row" id="repo-form">
@@ -115,9 +116,8 @@
         <summary class="dim tiny">show the file</summary>
         <pre id="config-yaml"></pre>
       </details>
-    </div>
   </div>
-</div>
+</section>
 
 <script src="/static/app.js"></script>
 </body>

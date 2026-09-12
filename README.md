@@ -93,9 +93,9 @@ bazel --open   # and opens the browser
 
 On first run `~/.bazel/config.yaml` is created for you. Then, in the page:
 
-1. Open **config** and add a repository (`owner/repo`).
-2. In the same dialog, turn one of your installed skills into an **agent**.
-3. Tick a PR, pick the agent, hit **review**.
+1. Go to **config** and add a repository (`owner/repo`).
+2. On the same page, turn one of your installed skills into an **agent**.
+3. Back on the **dashboard**, tick a PR, pick the agent, hit **run**.
 
 | Flag | Effect |
 | --- | --- |
@@ -185,7 +185,7 @@ bazel-post-report used when publishing ✓ /bazel-post-report
 The `✗` is the warning that matters: that agent calls a skill that is **not on
 this machine** and would only fail at run time. Skills are usually symlinks into
 the repository where you version them, and Bazel follows the links; the list is
-read from disk every time you open the dialog, so installing a skill needs no
+read from disk every time you open the page, so installing a skill needs no
 restart.
 
 ### The skill that ships inside Bazel
@@ -362,8 +362,14 @@ warns you first.
 
 ## Configuration
 
+The interface is two pages, switched from the top right and addressable by URL:
+the **dashboard**, with the PRs, the queue and whatever you are reading, and
+**config**. Switching does not reload anything — the event stream stays open and
+a review in flight keeps its log — and reopening the tab at `#/config` comes
+straight back to the configuration.
+
 Everything the page changes — repos, agents, pipelines, the default — is written
-to one file. The dialog no longer prints it at you: at the bottom there is **save
+to one file. The page no longer prints it at you: at the bottom there is **save
 config.yaml**, which downloads it, and a collapsed *show the file* if you want to
 read it. Dropping that file at the same path on another machine brings Bazel up
 already configured.

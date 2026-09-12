@@ -117,15 +117,18 @@ async function boot() {
     state.repos = st.repos || [];
     renderRepoFilter();
     if (!state.repos.length) {
-      banner('No repositories watched — open "config" at the top and add one (owner/repo).');
+      banner('No repositories watched — go to "config" and add one (owner/repo).');
     } else if (!selectableAgents().length) {
-      banner('No agents configured — open "config" at the top and build your list out of the installed skills.');
+      banner('No agents configured — go to "config" and build your list out of the installed skills.');
     }
     renderJobs();
   } catch (err) {
     banner('Could not reach the server: ' + err.message);
     return;
   }
+  // A página só é escolhida depois que o estado chegou: abrir a aba direto em
+  // #/config precisa da lista de agentes para desenhar qualquer coisa.
+  await route();
   loadPRs(false);
 }
 
@@ -987,7 +990,7 @@ function updateReviewButton() {
   const semAgente = !selectableAgents().length;
   btn.disabled = n === 0 || semAgente;
   btn.title = semAgente
-    ? 'no agents configured — open "config" and build the list out of your skills'
+    ? 'no agents configured — go to "config" and build the list out of your skills'
     : 'runs the chosen agent over the ticked PRs';
   btn.textContent = n > 1 ? `run ${n}` : 'run';
 }
@@ -1418,15 +1421,15 @@ function wire() {
   document.querySelectorAll('.tab').forEach((t) => {
     t.addEventListener('click', () => { state.tab = t.dataset.tab; state.activeSaved = null; renderTabs(); if (state.tab === 'queue') renderViewer(); });
   });
-  $('#show-config').addEventListener('click', showConfig);
+  window.addEventListener('hashchange', route);
   $('#repo-form').addEventListener('submit', addRepo);
   // O arquivo inteiro, para levar a outra máquina. O servidor manda com
   // Content-Disposition, então um link basta — sem Blob, sem cópia na memória.
   $('#config-download').addEventListener('click', () => { window.location.href = '/api/config/file'; });
-  $('#modal-close').addEventListener('click', () => { $('#modal').hidden = true; });
-  $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').hidden = true; });
   document.addEventListener('keydown', (e) => {
-    if (e.key === 'Escape') $('#modal').hidden = true;
+    // Escape na configuração volta ao dashboard: é o que o modal fazia, e o
+    // dedo de quem já usava o Bazel continua sabendo disso.
+    if (e.key === 'Escape' && pageFromHash() === 'config') location.hash = '#/';
     if (e.key === '/' && document.activeElement !== $('#filter')) { e.preventDefault(); $('#filter').focus(); }
     if (e.key === 'r' && (e.metaKey || e.ctrlKey)) return;
   });
@@ -1733,9 +1736,30 @@ async function loadSkills() {
   }
 }
 
-async function showConfig() {
-  await refreshConfig();
-  $('#modal').hidden = false;
+// --- as duas páginas ---
+//
+// A navegação é por hash e não recarrega nada: o SSE fica aberto, os jobs
+// continuam na memória e o review que você estava lendo está lá quando você
+// volta. Recarregar a aba em #/config abre direto na configuração, que é o que
+// se espera de uma página de verdade.
+function pageFromHash() {
+  return location.hash.replace(/^#\/?/, '') === 'config' ? 'config' : 'dashboard';
+}
+
+async function showPage(nome) {
+  $('#page-dashboard').hidden = nome !== 'dashboard';
+  $('#page-config').hidden = nome !== 'config';
+  for (const a of document.querySelectorAll('#nav a')) {
+    a.classList.toggle('on', a.dataset.page === nome);
+  }
+  document.title = nome === 'config' ? 'Bazel · config' : 'Bazel';
+  // A configuração é lida do disco a cada visita: ela muda por fora — outra
+  // aba, um editor — e mostrar o que estava em memória seria mentir.
+  if (nome === 'config') await refreshConfig();
+}
+
+function route() {
+  return showPage(pageFromHash());
 }
 
 // refreshConfig redesenha a configuração inteira a partir do disco. É chamada

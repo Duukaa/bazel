@@ -1129,3 +1129,248 @@ func TestReadSkipAceitaCorpoVazio(t *testing.T) {
 		}
 	}
 }
+
+// Agente cuja saída não é review não tem caminho para o PR: nem o agente de
+// post, nem o comentário colado. A página esconde os botões; isto é o que
+// segura um pedido vindo de fora dela.
+func TestPublicarRecusaSaidaQueNaoEReview(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	naoPublica := false
+	cfg := cfgFor(t, "echo")
+	cfg.Agent.Prompt = "{{task}}"
+	cfg.Agents = []config.AgentDef{
+		{Name: "history-pr", Command: "echo", Args: []string{"48 commits, 3 rodadas"}, Publishable: &naoPublica},
+	}
+	choice, err := cfg.ChoiceByName("history-pr")
+	if err != nil {
+		t.Fatalf("ChoiceByName: %v", err)
+	}
+
+	hub := NewHub()
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	m := NewManager(ctx, cfg, t.TempDir(), 1, false, hub)
+	view, err := m.Enqueue(testPR(482), false, choice)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	done := waitFor(t, ch, view.ID, StateDone)
+	if done.Publishable {
+		t.Error("o job devia dizer à página que isto não vai ao PR")
+	}
+	if done.SavedTo == "" {
+		t.Error("não publicar não quer dizer não salvar: o relatório fica em disco")
+	}
+
+	if _, err := m.PublishWithAgent(view.ID, nil); err == nil {
+		t.Error("o agente de post não devia aceitar o que não é review")
+	}
+	if _, err := m.Post(context.Background(), view.ID, nil); err == nil {
+		t.Error("colar como comentário é o mesmo destino por outra porta")
+	}
+}
+
+// O painel monta a pipeline pela API: cria, aparece no seletor, e sai por uma
+// rota própria — pipeline está em `pipelines:`, agente está em `agents:`.
+func TestPipelineEndpoints(t *testing.T) {
+	srv := newTestServer(t)
+	h := srv.Handler()
+
+	post := func(t *testing.T, path, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "http://127.0.0.1"+path, strings.NewReader(body))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	for _, skill := range []string{"history-pr", "review-fleet"} {
+		if rec := post(t, "/api/agents", `{"skill":"`+skill+`"}`); rec.Code != http.StatusCreated {
+			t.Skipf("a skill %s não está instalada nesta máquina: %s", skill, rec.Body)
+		}
+	}
+
+	rec := post(t, "/api/pipelines", `{"name":"history then review","steps":["history-pr","review-fleet"]}`)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("criando a pipeline: %d %s", rec.Code, rec.Body)
+	}
+	var out struct {
+		Agents []struct {
+			Name     string   `json:"name"`
+			Pipeline bool     `json:"pipeline"`
+			Steps    []string `json:"steps"`
+		} `json:"agents"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decodificando: %v", err)
+	}
+	var achou bool
+	for _, a := range out.Agents {
+		if a.Name == "history then review" {
+			achou = true
+			if !a.Pipeline || len(a.Steps) != 2 || a.Steps[0] != "history-pr" {
+				t.Errorf("a pipeline devia vir com seus passos na ordem: %+v", a)
+			}
+		}
+	}
+	if !achou {
+		t.Fatalf("a pipeline criada devia estar no seletor: %+v", out.Agents)
+	}
+
+	// Passo que não é agente é recusado com o motivo, não com um 500.
+	if rec := post(t, "/api/pipelines", `{"name":"x","steps":["nao-existe"]}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("passo desconhecido devia dar 400, veio %d: %s", rec.Code, rec.Body)
+	}
+
+	req := httptest.NewRequest(http.MethodDelete, "http://127.0.0.1/api/pipelines/history%20then%20review", nil)
+	del := httptest.NewRecorder()
+	h.ServeHTTP(del, req)
+	if del.Code != http.StatusOK {
+		t.Fatalf("removendo a pipeline: %d %s", del.Code, del.Body)
+	}
+	if strings.Contains(del.Body.String(), "history then review") {
+		t.Errorf("a pipeline removida não devia voltar na lista: %s", del.Body)
+	}
+}
+
+// O config.yaml é o que se leva para outra máquina: sai como arquivo, com o
+// nome certo, e não como texto para copiar da tela.
+func TestConfigDownload(t *testing.T) {
+	srv := newTestServer(t)
+	// O download é o arquivo em disco; sem ele gravado não há o que baixar.
+	if err := srv.cfg.Save(); err != nil {
+		t.Fatalf("gravando o config: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/config/file", nil)
+	rec := httptest.NewRecorder()
+	srv.Handler().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("baixando o config: %d %s", rec.Code, rec.Body)
+	}
+	if cd := rec.Header().Get("Content-Disposition"); !strings.Contains(cd, `filename="config.yaml"`) {
+		t.Errorf("devia vir como anexo com nome: %q", cd)
+	}
+	if !strings.Contains(rec.Body.String(), "agent:") {
+		t.Errorf("o corpo devia ser o yaml do disco: %q", rec.Body.String())
+	}
+}
+
+// A pipeline com `pause` roda o que vem antes, para, e espera. O worker sai —
+// a fila não pode ficar parada esperando uma pessoa ler — e o clone fica.
+func TestPipelinePausaEContinua(t *testing.T) {
+	cfg := cfgFor(t, "echo")
+	cfg.Agent.Prompt = "{{task}}"
+	cfg.Agent.Checkout = false
+	cfg.Agents = []config.AgentDef{
+		{Name: "primeiro", Command: "echo", Args: []string{"o que saiu do primeiro"}},
+		{Name: "segundo", Command: "echo", Args: []string{"o que saiu do segundo"}},
+	}
+	cfg.Pipelines = []config.Pipeline{{Name: "com pausa", Steps: []string{"primeiro", "pause", "segundo"}}}
+	choice, err := cfg.ChoiceByName("com pausa")
+	if err != nil {
+		t.Fatalf("ChoiceByName: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := NewHub()
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	m := NewManager(ctx, cfg, t.TempDir(), 1, false, hub)
+	view, err := m.Enqueue(testPR(482), false, choice)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	parado := waitFor(t, ch, view.ID, StatePaused)
+	if !parado.Paused {
+		t.Error("o job devia dizer à página que está esperando por ela")
+	}
+	if parado.NextStep != "segundo" {
+		t.Errorf("o botão precisa dizer o que vem: %q", parado.NextStep)
+	}
+	// O relatório do que já rodou está na tela, e nada foi salvo nem publicado.
+	cheio, _ := m.View(view.ID, true)
+	if !strings.Contains(cheio.Body, "o que saiu do primeiro") {
+		t.Errorf("o parcial devia estar legível: %q", cheio.Body)
+	}
+	if strings.Contains(cheio.Body, "o que saiu do segundo") {
+		t.Error("o passo depois da pausa não podia ter rodado")
+	}
+	if cheio.SavedTo != "" {
+		t.Error("meio de pipeline não vira arquivo em disco")
+	}
+
+	// E o worker está livre: outro review roda enquanto este espera.
+	solo, err := cfg.ChoiceByName("primeiro")
+	if err != nil {
+		t.Fatalf("ChoiceByName: %v", err)
+	}
+	outro, err := m.Enqueue(testPR(483), false, solo)
+	if err != nil {
+		t.Fatalf("Enqueue do segundo PR: %v", err)
+	}
+	waitFor(t, ch, outro.ID, StateDone)
+
+	if _, err := m.Continue(view.ID); err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	fim := waitFor(t, ch, view.ID, StateDone)
+	if fim.Paused {
+		t.Error("continuado, o job não está mais esperando ninguém")
+	}
+	completo, _ := m.View(view.ID, true)
+	if !strings.Contains(completo.Body, "o que saiu do primeiro") ||
+		!strings.Contains(completo.Body, "o que saiu do segundo") {
+		t.Errorf("o relatório final junta as duas rodadas:\n%s", completo.Body)
+	}
+	if completo.SavedTo == "" {
+		t.Error("terminada, a pipeline salva o review inteiro")
+	}
+
+	// Continuar o que não está parado é erro, não um segundo disparo.
+	if _, err := m.Continue(view.ID); err == nil {
+		t.Error("continuar um job terminado devia dar erro")
+	}
+}
+
+// Desistir de uma pipeline parada não apaga o que já foi lido, e larga o clone.
+func TestPipelinePausadaPodeSerAbandonada(t *testing.T) {
+	cfg := cfgFor(t, "echo")
+	cfg.Agent.Prompt = "{{task}}"
+	cfg.Agent.Checkout = false
+	cfg.Agents = []config.AgentDef{
+		{Name: "primeiro", Command: "echo", Args: []string{"parcial"}},
+		{Name: "segundo", Command: "echo", Args: []string{"nunca roda"}},
+	}
+	cfg.Pipelines = []config.Pipeline{{Name: "com pausa", Steps: []string{"primeiro", "pause", "segundo"}}}
+	choice, _ := cfg.ChoiceByName("com pausa")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := NewHub()
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	m := NewManager(ctx, cfg, t.TempDir(), 1, false, hub)
+	view, err := m.Enqueue(testPR(482), false, choice)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	waitFor(t, ch, view.ID, StatePaused)
+
+	if err := m.Cancel(view.ID); err != nil {
+		t.Fatalf("Cancel: %v", err)
+	}
+	fim := waitFor(t, ch, view.ID, StateCanceled)
+	if fim.Paused {
+		t.Error("cancelada, não espera mais ninguém")
+	}
+	if _, err := m.Continue(view.ID); err == nil {
+		t.Error("não dá para continuar o que foi abandonado")
+	}
+}

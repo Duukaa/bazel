@@ -87,8 +87,23 @@ type Result struct {
 	Duration  time.Duration
 	Truncated bool
 	// Workdir é o clone temporário onde os agentes rodaram. Vazio quando o
-	// checkout está desligado; só sobrevive ao review com KeepWorkspace.
+	// checkout está desligado; só sobrevive ao review com KeepWorkspace — ou
+	// quando a execução parou num passo reservado, e aí o clone é de quem
+	// chamou: é nele que o resto da pipeline vai continuar.
 	Workdir string
+	// StoppedAt é o índice do passo reservado onde a execução parou. -1 quando
+	// a escolha rodou até o fim. O Runner não executa `pause` nem `publish`:
+	// o primeiro espera uma pessoa e o segundo precisa do relatório em disco,
+	// e nenhuma das duas coisas é trabalho dele.
+	StoppedAt int
+}
+
+// Cont é por onde uma execução interrompida recomeça: o passo seguinte ao que
+// parou, o clone que ficou de pé e o que já tinha rodado.
+type Cont struct {
+	From    int
+	Workdir string
+	Steps   []StepResult
 }
 
 // Runner roda os agentes configurados.
@@ -112,7 +127,14 @@ func New(cfg *config.Config) *Runner { return &Runner{cfg: cfg} }
 // onEvent, se não for nil, recebe o andamento passo a passo. É chamada da
 // goroutine do review, então quem escuta não pode bloquear nela.
 func (r *Runner) Review(ctx context.Context, pr gh.PR, choice config.Choice, onEvent func(Event)) (Result, error) {
-	return r.run(ctx, pr, choice, nil, onEvent)
+	return r.run(ctx, pr, choice, nil, Cont{}, onEvent)
+}
+
+// Continue retoma uma escolha que parou num passo reservado, do passo indicado
+// em diante e dentro do mesmo clone. O relatório sai com os passos de todas as
+// rodadas juntos: quem lê não tem por que saber que houve uma pausa no meio.
+func (r *Runner) Continue(ctx context.Context, pr gh.PR, choice config.Choice, cont Cont, onEvent func(Event)) (Result, error) {
+	return r.run(ctx, pr, choice, nil, cont, onEvent)
 }
 
 // Publish roda o agente de publicação sobre um review que já está pronto — o
@@ -123,10 +145,10 @@ func (r *Runner) Publish(ctx context.Context, pr gh.PR, choice config.Choice, re
 	return r.run(ctx, pr, choice, map[string]string{
 		"{{review_file}}": reviewPath,
 		"{{review}}":      reviewBody,
-	}, onEvent)
+	}, Cont{}, onEvent)
 }
 
-func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra map[string]string, onEvent func(Event)) (Result, error) {
+func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra map[string]string, cont Cont, onEvent func(Event)) (Result, error) {
 	start := time.Now()
 	emit := func(e Event) {
 		if onEvent != nil {
@@ -142,10 +164,17 @@ func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra 
 	}
 	total := len(choice.Steps)
 
-	var workdir string
-	if choice.NeedsCheckout() {
+	// Retomando, o clone é o que ficou de pé na parada e o dono dele é quem
+	// nos chamou — clonar de novo daria outro código, e os passos já corridos
+	// falariam de um repositório que não é este.
+	var (
+		workdir = cont.Workdir
+		ws      *workspace.Workspace
+	)
+	if workdir == "" && choice.NeedsCheckout() {
 		emit(Event{Kind: EventClone, Total: total, Name: pr.Key()})
-		ws, err := workspace.Prepare(ctx, pr)
+		var err error
+		ws, err = workspace.Prepare(ctx, pr)
 		if err != nil {
 			return Result{}, err
 		}
@@ -172,11 +201,26 @@ func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra 
 		return Result{}, err
 	}
 
-	steps := make([]StepResult, 0, total)
+	// Os passos das rodadas anteriores entram no relatório final: quem lê não
+	// tem por que saber que houve uma pausa no meio.
+	steps := append(make([]StepResult, 0, total), cont.Steps...)
 	// fechado é o gasto dos passos que já terminaram: o parcial de um passo
 	// em curso é somado a ele, para o número na tela ser o do review todo.
 	var fechado Usage
-	for i, step := range choice.Steps {
+	for _, s := range steps {
+		fechado.add(s.Usage)
+	}
+	for i := cont.From; i < len(choice.Steps); i++ {
+		step := choice.Steps[i]
+		// Passo reservado é do Bazel, não do Runner: devolve o que já saiu e
+		// quem chamou decide — esperar uma pessoa, ou publicar.
+		if step.Reserved != "" {
+			if ws != nil {
+				// O clone não morre aqui: é nele que o resto vai continuar.
+				ws.Keep = true
+			}
+			return r.parcial(pr, choice, steps, workdir, truncated, i, start)
+		}
 		emit(Event{Kind: EventStep, Index: i, Total: total, Name: step.Name})
 
 		dir := workdir
@@ -235,6 +279,35 @@ func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra 
 		Duration:  time.Since(start),
 		Truncated: truncated,
 		Workdir:   workdir,
+		StoppedAt: -1,
+	}, nil
+}
+
+// parcial é o resultado de uma execução que parou num passo reservado: tem o
+// relatório do que já rodou — é o que a pessoa lê antes de mandar continuar — e
+// diz onde parar e onde recomeçar.
+func (r *Runner) parcial(pr gh.PR, choice config.Choice, steps []StepResult, workdir string, truncated bool, at int, start time.Time) (Result, error) {
+	body, err := joinSteps(steps)
+	if err != nil {
+		// Tudo que rodou até aqui falhou: não há o que ler nem o que publicar,
+		// e parar para mostrar o nada seria pior do que falhar agora.
+		return Result{}, err
+	}
+	var used Usage
+	for _, s := range steps {
+		used.add(s.Usage)
+	}
+	return Result{
+		PR:        pr,
+		Agent:     choice.Name,
+		Posts:     choice.Posts,
+		Body:      body,
+		Steps:     steps,
+		Usage:     used,
+		Duration:  time.Since(start),
+		Truncated: truncated,
+		Workdir:   workdir,
+		StoppedAt: at,
 	}, nil
 }
 
@@ -289,6 +362,33 @@ func (r *Runner) material(ctx context.Context, pr gh.PR, choice config.Choice) (
 		diff += "\n\n[... diff truncated at " + strconv.Itoa(r.cfg.MaxDiffBytes) + " bytes ...]"
 	}
 	return diff, truncated, nil
+}
+
+// PublishableBody é o que vai ao PR: o corpo só dos passos cuja saída é
+// publicável. Numa pipeline `history-pr → review-fleet` a tela mostra as duas
+// coisas — é para isso que você encadeou — mas o PR recebe só o review. A
+// história é contexto para quem vai revisar, não um comentário para o autor.
+//
+// O bool diz se sobrou algo de fora: com ele falso o relatório inteiro é o que
+// se publica, e o arquivo em disco já serve.
+func PublishableBody(res Result, choice config.Choice) (string, bool, error) {
+	kept := make([]StepResult, 0, len(res.Steps))
+	for _, s := range res.Steps {
+		if choice.StepPublishes(s.Name) {
+			kept = append(kept, s)
+		}
+	}
+	if len(kept) == len(res.Steps) {
+		return res.Body, false, nil
+	}
+	if len(kept) == 0 {
+		return "", true, errors.New("no step of this agent publishes to the PR")
+	}
+	body, err := joinSteps(kept)
+	if err != nil {
+		return "", true, err
+	}
+	return body, true, nil
 }
 
 // joinSteps monta o relatório final. Um passo só sai cru, como sempre saiu;

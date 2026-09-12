@@ -139,3 +139,50 @@ func TestPRFromTitleEReviewBody(t *testing.T) {
 		t.Errorf("sem separador o corpo é o arquivo: %q", got)
 	}
 }
+
+// Um review salvo carrega quem o escreveu. É o que permite, uma sessão depois,
+// saber se o que está no disco pode ir ao PR — o servidor reinicia, o arquivo
+// fica, e um relatório de história continua não sendo um review.
+func TestSavedEntryCarregaOAgente(t *testing.T) {
+	dir := t.TempDir()
+	pr := prFor("abc123")
+
+	if _, err := Save(dir, agent.Result{PR: pr, Agent: "history-pr", Body: "48 commits"}); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	entries, err := List(dir)
+	if err != nil {
+		t.Fatalf("List: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Fatalf("esperava 1 review salvo, veio %d", len(entries))
+	}
+	if entries[0].Agent != "history-pr" {
+		t.Errorf("o agente devia vir do cabeçalho: %q", entries[0].Agent)
+	}
+	if entries[0].Repo != "acme/api-core" || entries[0].Number != 482 {
+		t.Errorf("o PR continua saindo do título: %+v", entries[0])
+	}
+}
+
+// Numa pipeline o Save escreve o tempo de cada passo depois do nome. O que
+// identifica a escolha é o nome, antes do travessão.
+func TestAgentFromLine(t *testing.T) {
+	casos := map[string]string{
+		"- Agent: review-fleet": "review-fleet",
+		"- Agent: história e review — history-pr (2s) → review-fleet (41s)": "história e review",
+		"- Agent: ": "",
+	}
+	for linha, want := range casos {
+		if got := AgentFromLine(linha); got != want {
+			t.Errorf("AgentFromLine(%q) = %q, queria %q", linha, got, want)
+		}
+	}
+	arquivo := "# acme/api-core#482 — título\n\n- Author: @maria\n- Agent: history-pr\n\n---\n\ncorpo\n"
+	if got := AgentOf(arquivo); got != "history-pr" {
+		t.Errorf("AgentOf = %q", got)
+	}
+	if got := AgentOf("# sem agente\n\n---\n\n- Agent: tarde demais\n"); got != "" {
+		t.Errorf("depois do --- é corpo, não cabeçalho: %q", got)
+	}
+}

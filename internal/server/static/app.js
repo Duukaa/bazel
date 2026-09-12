@@ -12,6 +12,8 @@ const state = {
   agents: [],         // escolhas do seletor: agents e pipelines
   limits: null,       // cota do Claude: sessão (5h) e semana (7d)
   skills: [],         // skills instaladas na máquina
+  pipeSteps: [],      // passos que o montador de pipeline está juntando
+  pipeName: '',       // nome que o montador vai dar à pipeline
   skillsDir: '',
   agent: '',          // nome do que roda no próximo review
   selected: new Set(),
@@ -381,6 +383,24 @@ async function publishJob(id, btn) {
   }
 }
 
+// continueJob solta uma pipeline parada. O card volta a rodar do passo
+// seguinte, dentro do mesmo clone que ficou de pé durante a leitura.
+async function continueJob(id, btn) {
+  if (btn) { btn.disabled = true; btn.textContent = 'continuing…'; }
+  try {
+    const view = await api(`/api/jobs/${encodeURIComponent(id)}/continue`, { method: 'POST' });
+    upsertJob(view);
+    state.activeJob = view.id;
+    state.tab = 'queue';
+    renderTabs();
+    renderJobs();
+    renderViewer();
+  } catch (err) {
+    banner(err.message);
+    if (btn) { btn.disabled = false; btn.textContent = 'continue'; }
+  }
+}
+
 async function postJob(id, btn) {
   const job = state.jobs.find((j) => j.id === id);
   if (!job) return;
@@ -433,7 +453,12 @@ async function openSaved(name) {
     // Um review salvo continua publicável: fechar o Bazel antes de mandá-lo
     // ao PR não pode custar o trabalho do agente.
     const entry = state.saved.find((x) => x.name === name);
-    if (entry && entry.repo) {
+    if (entry && entry.repo && entry.publishable === false) {
+      const nota = el('p', 'dim');
+      nota.style.marginTop = '28px';
+      nota.textContent = `This is not a review — what "${entry.agent}" produces stays in Bazel.`;
+      v.append(nota);
+    } else if (entry && entry.repo) {
       const bar = el('div', 'viewer-actions');
       const pub = el('button', 'btn primary', 'publish inline review');
       pub.title = `runs the post skill and publishes to ${entry.repo}#${entry.number} with inline comments`;
@@ -674,7 +699,8 @@ function renderAgents() {
   if (!opcoes.length) { sel.hidden = true; return; }
   sel.hidden = false;
   for (const a of opcoes) {
-    const opt = el('option', null, a.name + (a.pipeline ? ' ⛓' : '') + (a.posts ? ' ⇧ publishes' : ''));
+    const opt = el('option', null, a.name + (a.pipeline ? ' ⛓' : '')
+      + (a.posts ? ' ⇧ publishes' : '') + (a.publishable === false ? ' · stays here' : ''));
     opt.value = a.name;
     opt.title = [a.description, a.pipeline ? (a.steps || []).join(' → ') : '']
       .filter(Boolean).join('\n');
@@ -691,6 +717,7 @@ function agentTitle(name) {
     a.description,
     a.pipeline ? 'pipeline: ' + (a.steps || []).join(' → ') : '',
     a.posts ? '⇧ this agent publishes the review to the PR on its own' : '',
+    a.publishable === false ? 'what it produces is not a review — it stays in Bazel' : '',
   ].filter(Boolean).join('\n') || a.name;
 }
 
@@ -1082,7 +1109,21 @@ function renderJobs() {
       b.addEventListener('click', (e) => { e.stopPropagation(); cancelJob(job.id); });
       actions.append(b);
     }
-    if (job.state === 'done' && !job.publishing) {
+    if (job.paused) {
+      const c = el('button', 'btn small', 'continue');
+      c.title = job.next_step ? `runs ${job.next_step} next` : 'runs the rest of the pipeline';
+      c.addEventListener('click', (e) => { e.stopPropagation(); continueJob(job.id, c); });
+      actions.append(c);
+      const d = el('button', 'btn small ghost', 'stop here');
+      d.title = 'gives up on the rest of the pipeline — what already ran stays on screen';
+      d.addEventListener('click', (e) => { e.stopPropagation(); cancelJob(job.id); });
+      actions.append(d);
+    }
+    if (job.state === 'done' && !job.publishing && job.publishable === false) {
+      const t = el('span', 'dim', 'stays here');
+      t.title = `what "${job.agent}" produces does not go to the PR`;
+      actions.append(t);
+    } else if (job.state === 'done' && !job.publishing) {
       if (!job.posted) {
         const p = el('button', 'btn small', 'publish inline review');
         p.title = 'runs the post skill and publishes with inline comments';
@@ -1122,6 +1163,7 @@ function labelParts(job) {
     case 'done': return ['done in', job.seconds + 's'];
     case 'failed': return ['failed', ''];
     case 'canceled': return ['canceled', ''];
+    case 'paused': return ['waiting on you', ''];
     default: return [job.state, ''];
   }
 }
@@ -1265,9 +1307,35 @@ function renderViewer() {
   if (job.steps && job.steps.length > 1) v.append(stepsBox(job));
   if (job.log_lines) v.append(logPanel(job, false));
 
+  // Parada: você acabou de ler o que saiu até aqui, e a decisão é seguir ou
+  // não. Publicar não entra — o que está na tela é meio de uma pipeline, e não
+  // foi nem salvo em disco ainda.
+  if (job.paused) {
+    const bar = el('div', 'viewer-actions');
+    const go = el('button', 'btn primary', job.next_step ? 'continue → ' + job.next_step : 'continue');
+    go.addEventListener('click', () => continueJob(job.id, go));
+    const stop = el('button', 'btn ghost', 'stop here');
+    stop.title = 'gives up on the rest of the pipeline — what you just read stays on screen';
+    stop.addEventListener('click', () => cancelJob(job.id));
+    bar.append(go, stop);
+    v.append(bar);
+    v.append(el('p', 'dim', 'This pipeline is paused: the clone is still up and the rest of it runs'
+      + ' inside the same one when you continue. Nothing has been saved or published yet.'));
+    return;
+  }
+
   // As ações ficam depois do review, e não antes: é aqui que você chega
   // quando terminou de ler — que é o momento de decidir se isso vai para o PR.
-  if (!job.publishing) {
+  if (!job.publishing && job.publishable === false) {
+    // Agente que não produz review não tem para onde publicar. Dizer isso aqui
+    // é melhor do que não mostrar nada: você acabou de ler o relatório e a
+    // pergunta seguinte é sempre "e agora, isso vai pro PR?".
+    const nota = el('p', 'dim');
+    nota.style.marginTop = '28px';
+    nota.textContent = `This is not a review — what "${job.agent}" produces stays in Bazel.`
+      + ' Run a reviewing agent over this PR when you want something to publish.';
+    v.append(nota);
+  } else if (!job.publishing) {
     const bar = el('div', 'viewer-actions');
     const pub = el('button', 'btn primary', 'publish inline review');
     pub.title = 'runs the post skill and publishes to the PR with inline comments';
@@ -1352,6 +1420,9 @@ function wire() {
   });
   $('#show-config').addEventListener('click', showConfig);
   $('#repo-form').addEventListener('submit', addRepo);
+  // O arquivo inteiro, para levar a outra máquina. O servidor manda com
+  // Content-Disposition, então um link basta — sem Blob, sem cópia na memória.
+  $('#config-download').addEventListener('click', () => { window.location.href = '/api/config/file'; });
   $('#modal-close').addEventListener('click', () => { $('#modal').hidden = true; });
   $('#modal').addEventListener('click', (e) => { if (e.target.id === 'modal') $('#modal').hidden = true; });
   document.addEventListener('keydown', (e) => {
@@ -1380,6 +1451,7 @@ function renderAgentList() {
     top.append(el('span', 'agent-name', a.name));
     if (a.pipeline) top.append(el('span', 'tag', 'pipeline'));
     if (a.posts) top.append(el('span', 'tag posts', '⇧ publishes'));
+    if (a.publishable === false) top.append(el('span', 'tag', 'not a review'));
     if (a.publisher) top.append(el('span', 'tag', 'used when publishing'));
     else if (state.agent === a.name) top.append(el('span', 'tag mine', 'default'));
 
@@ -1393,8 +1465,25 @@ function renderAgentList() {
         d.addEventListener('click', () => agentAction('/api/agents/' + encodeURIComponent(a.name) + '/default', 'POST', d));
         top.append(d);
       }
+      // O tique da publicação. Agente que publica sozinho não aparece aqui:
+      // ele escreve no PR por conta própria, e desligar um botão não o
+      // impediria de nada — o jeito é tirá-lo da lista.
+      if (!a.posts && !a.pipeline) {
+        const pb = el('button', 'btn small ghost',
+          a.publishable === false ? 'output stays here' : '⇧ output can go to the PR');
+        pb.title = a.publishable === false
+          ? 'this agent produces no review — Bazel offers no way to publish it. Click to allow it again.'
+          : 'the result of this agent can be published to the PR. Click if it is not a review.';
+        pb.addEventListener('click', () => agentAction(
+          '/api/agents/' + encodeURIComponent(a.name) + '/publishable', 'POST', pb,
+          { publishable: a.publishable === false }));
+        top.append(pb);
+      }
+      // Pipeline e agente saem por portas diferentes: uma está em
+      // `pipelines:`, o outro em `agents:`.
+      const base = a.pipeline ? '/api/pipelines/' : '/api/agents/';
       const rm = el('button', 'btn small ghost', 'remove');
-      rm.addEventListener('click', () => agentAction('/api/agents/' + encodeURIComponent(a.name), 'DELETE', rm));
+      rm.addEventListener('click', () => agentAction(base + encodeURIComponent(a.name), 'DELETE', rm));
       top.append(rm);
     }
     row.append(top);
@@ -1429,10 +1518,156 @@ async function agentAction(path, method, btn, body) {
     // review, e quem está com a configuração aberta precisa saber.
     banner(selectableAgents().length ? '' : 'No agents configured — pick below which skills become agents.');
     await refreshConfig();
+    return true;
   } catch (err) {
     banner(err.message);
     btn.disabled = false;
+    return false;
   }
+}
+
+// renderPipelineBuilder monta a sequência: você escolhe os agentes na ordem em
+// que eles devem rodar sobre o mesmo clone, dá um nome e cria.
+//
+// Os passos são agentes da lista de cima, não skills soltas — é o que garante
+// que cada passo já tem prompt, comando e o tique de publicação resolvidos, e
+// é o que o servidor exige.
+function renderPipelineBuilder() {
+  const box = $('#pipeline-builder');
+  box.innerHTML = '';
+
+  const disponiveis = state.agents.filter((a) => !a.publisher && !a.pipeline);
+  // Um agente já basta: `review-fleet → pause → publish` é uma pipeline de um
+  // agente só, e é justamente a que existe para você ler antes de mandar.
+  if (!disponiveis.length) {
+    box.append(el('p', 'none', 'add an agent above, and you can chain it into a pipeline here.'));
+    state.pipeSteps = [];
+    return;
+  }
+  // Agente removido lá em cima não pode continuar no rascunho daqui. Os passos
+  // reservados ficam: eles não dependem da lista.
+  state.pipeSteps = state.pipeSteps.filter((n) =>
+    n === 'pause' || n === 'publish' || disponiveis.some((a) => a.name === n));
+
+  const passos = el('div', 'pipe-steps');
+  if (!state.pipeSteps.length) {
+    passos.append(el('span', 'dim', 'no step yet — pick the agents below, in the order they should run'));
+  }
+  state.pipeSteps.forEach((nome, i) => {
+    if (i > 0) passos.append(el('span', 'pipe-arrow', '→'));
+    const reservado = nome === 'pause' || nome === 'publish';
+    const chip = el('span', 'pipe-step' + (reservado ? ' reserved' : ''));
+    chip.append(el('span', 'n', i + 1), document.createTextNode(nome === 'pause' ? '⏸ pause' : nome));
+
+    const mover = (de, para) => {
+      const [x] = state.pipeSteps.splice(de, 1);
+      state.pipeSteps.splice(para, 0, x);
+      renderPipelineBuilder();
+    };
+    const sobe = el('button', null, '↑');
+    sobe.title = 'run this one earlier';
+    sobe.disabled = i === 0;
+    sobe.addEventListener('click', () => mover(i, i - 1));
+    const desce = el('button', null, '↓');
+    desce.title = 'run this one later';
+    desce.disabled = i === state.pipeSteps.length - 1;
+    desce.addEventListener('click', () => mover(i, i + 1));
+    const tira = el('button', null, '×');
+    tira.title = 'take this step out';
+    tira.addEventListener('click', () => {
+      state.pipeSteps.splice(i, 1);
+      renderPipelineBuilder();
+    });
+    chip.append(sobe, desce, tira);
+    passos.append(chip);
+  });
+  box.append(passos);
+
+  const escolher = el('div', 'pipe-pick');
+  // Publicar é o fim da linha: depois dele a pipeline está fechada, e revisar
+  // mais deixaria em disco um review diferente do que o time acabou de ler.
+  const fechada = state.pipeSteps.includes('publish');
+  for (const a of disponiveis) {
+    const b = el('button', 'btn small ghost', '+ ' + a.name);
+    if (fechada) {
+      b.disabled = true;
+      b.title = 'publish is the last step — nothing runs after it';
+    } else if (state.pipeSteps.includes(a.name)) {
+      // (passo reservado pode repetir; agente, não — é o mesmo trabalho duas
+      // vezes sobre o mesmo clone)
+      // O mesmo agente duas vezes seria o mesmo trabalho duas vezes sobre o
+      // mesmo clone — o servidor recusa, e aqui o botão nem convida.
+      b.disabled = true;
+      b.title = 'already a step in this pipeline';
+    } else {
+      b.title = a.description || `adds ${a.name} as the next step`;
+      b.addEventListener('click', () => {
+        state.pipeSteps.push(a.name);
+        renderPipelineBuilder();
+      });
+    }
+    escolher.append(b);
+  }
+
+  // Os passos que o Bazel executa por conta própria. Valem as mesmas regras
+  // que o servidor aplica — desabilitar aqui é dizer o porquê antes, em vez de
+  // recusar depois.
+  const ultimo = state.pipeSteps[state.pipeSteps.length - 1];
+  const jaPublica = fechada;
+  const semAgente = !state.pipeSteps.some((n) => n !== 'pause' && n !== 'publish');
+  const addReservado = (nome, rotulo, dica) => {
+    const b = el('button', 'btn small ghost', rotulo);
+    let porque = '';
+    if (semAgente) porque = 'needs an agent before it — there would be nothing to show you yet';
+    else if (jaPublica) porque = 'publish is the last step — nothing runs after it';
+    else if (nome === 'pause' && ultimo === 'pause') porque = 'two pauses in a row run nothing between them';
+    else if (nome === 'publish' && !state.pipeSteps.some((n) => {
+      const a = state.agents.find((x) => x.name === n);
+      return a && a.publishable !== false;
+    })) porque = 'nothing before it produces a review that can go to the PR';
+    if (porque) { b.disabled = true; b.title = porque; }
+    else {
+      b.title = dica;
+      b.addEventListener('click', () => { state.pipeSteps.push(nome); renderPipelineBuilder(); });
+    }
+    escolher.append(b);
+  };
+  escolher.append(el('span', 'pipe-sep', '·'));
+  addReservado('pause', '+ ⏸ pause', 'stops here and waits for you to read what came out before the rest runs');
+  addReservado('publish', '+ publish', 'takes the report to the PR with the publishing agent — put it after a pause');
+
+  box.append(escolher);
+
+  const linha = el('div', 'pipe-row');
+  const nome = el('input');
+  nome.type = 'text';
+  nome.placeholder = 'pipeline name — how it shows up in the selector';
+  nome.autocomplete = 'off';
+  nome.value = state.pipeName || '';
+  nome.addEventListener('input', () => { state.pipeName = nome.value; });
+  const criar = el('button', 'btn primary', 'create pipeline');
+  const agentesEscolhidos = state.pipeSteps.filter((n) => n !== 'pause' && n !== 'publish').length;
+  let impede = '';
+  if (!agentesEscolhidos) impede = 'a pipeline needs at least one agent';
+  else if (agentesEscolhidos < 2 && state.pipeSteps.length < 2) impede = 'a pipeline chains two agents or more, or one agent and a step of its own';
+  else if (ultimo === 'pause') impede = 'a pause at the end has nothing to continue into — add a step after it, or drop the pause';
+  criar.disabled = !!impede;
+  criar.title = impede || 'creates the sequence and puts it in the selector';
+  const enviar = async () => {
+    const n = (state.pipeName || '').trim();
+    if (!n) { banner('give the pipeline a name.'); nome.focus(); return; }
+    const ok = await agentAction('/api/pipelines', 'POST', criar, { name: n, steps: state.pipeSteps });
+    if (!ok) return; // o erro já está no banner e o rascunho continua de pé
+    // Criada, o rascunho zera: o próximo montar começa do vazio, e a pipeline
+    // que acabou de nascer já está na lista de cima.
+    state.pipeSteps = [];
+    state.pipeName = '';
+    renderPipelineBuilder();
+  };
+  criar.addEventListener('click', enviar);
+  nome.addEventListener('keydown', (e) => { if (e.key === 'Enter') { e.preventDefault(); enviar(); } });
+  linha.append(nome, criar);
+  box.append(linha);
 }
 
 // renderSkillList mostra o que está instalado de fato — a lista que manda, e
@@ -1513,10 +1748,12 @@ async function refreshConfig() {
     $('#config-yaml').textContent = cfg.yaml;
   } catch (err) {
     $('#config-yaml').textContent = err.message;
+    $('#config-raw').open = true;
   }
   renderRepos();
   await loadSkills();
   renderAgentList();
+  renderPipelineBuilder();
   renderSkillList();
 }
 

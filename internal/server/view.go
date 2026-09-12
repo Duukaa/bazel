@@ -3,6 +3,7 @@ package server
 import (
 	"time"
 
+	"github.com/beroni/bazel/internal/config"
 	"github.com/beroni/bazel/internal/gh"
 	"github.com/beroni/bazel/internal/store"
 )
@@ -98,6 +99,15 @@ type jobView struct {
 	Agent    string `json:"agent,omitempty"`
 	Pipeline bool   `json:"pipeline,omitempty"`
 	Posts    bool   `json:"posts,omitempty"`
+	// Publishable diz se o que este job produziu pode ir ao PR. Vai sempre,
+	// sem omitempty: é justamente o false que a página precisa ler para
+	// esconder os botões de publicar.
+	Publishable bool `json:"publishable"`
+	// Paused marca a pipeline que parou num passo `pause` e espera você ler o
+	// que saiu e mandar continuar. NextStep é o que vem quando você mandar —
+	// é o que o botão de continuar diz.
+	Paused   bool   `json:"paused,omitempty"`
+	NextStep string `json:"next_step,omitempty"`
 	// Publishing marca o job que está levando ao PR um review já lido — o
 	// card do próprio review enquanto o agente de post roda, ou o card de uma
 	// publicação vinda do disco.
@@ -131,24 +141,25 @@ type jobView struct {
 // view serializa o job. Chamar com o lock do Manager seguro.
 func (j *Job) view(withBody bool) jobView {
 	v := jobView{
-		ID:        j.ID,
-		PR:        newPRView(j.PR, j.Mine, time.Now()),
-		Agent:     j.Choice.Name,
-		Pipeline:  j.Choice.Pipeline,
-		Posts:     j.Choice.Posts,
-		LogLines:  j.logSeq,
-		Steps:     j.stepViews(),
-		Cloning:   j.Cloning,
-		State:     j.State,
-		QueuedAt:  j.QueuedAt,
-		Seconds:   int(j.duration().Seconds()),
-		Err:       j.Err,
-		SavedTo:   j.SavedTo,
-		Workdir:   j.Result.Workdir,
-		Truncated: j.Result.Truncated,
-		Posted:    j.Posted,
-		PostErr:   j.PostErr,
-		HasBody:   j.Result.Body != "",
+		ID:          j.ID,
+		PR:          newPRView(j.PR, j.Mine, time.Now()),
+		Agent:       j.Choice.Name,
+		Pipeline:    j.Choice.Pipeline,
+		Posts:       j.Choice.Posts,
+		Publishable: j.Choice.Publishable,
+		LogLines:    j.logSeq,
+		Steps:       j.stepViews(),
+		Cloning:     j.Cloning,
+		State:       j.State,
+		QueuedAt:    j.QueuedAt,
+		Seconds:     int(j.duration().Seconds()),
+		Err:         j.Err,
+		SavedTo:     j.SavedTo,
+		Workdir:     j.Result.Workdir,
+		Truncated:   j.Result.Truncated,
+		Posted:      j.Posted,
+		PostErr:     j.PostErr,
+		HasBody:     j.Result.Body != "",
 	}
 	// Terminado, quem manda é o gasto fechado do resultado; antes disso, o
 	// parcial que o agente vai reportando. Publicando dentro do card do
@@ -165,6 +176,20 @@ func (j *Job) view(withBody bool) jobView {
 	}
 	if j.publish != nil {
 		v.Publishing = true
+	}
+	if j.State == StatePaused && j.cont != nil {
+		v.Paused = true
+		if i := j.cont.From; i >= 0 && i < len(j.Choice.Steps) {
+			st := j.Choice.Steps[i]
+			if st.Reserved == config.StepPublish {
+				// O passo de publicar não tem linha na lista, então o botão é
+				// o único lugar onde dá para dizer o que vem a seguir — e é
+				// escrita no PR de outra pessoa.
+				v.NextStep = "publish to the PR"
+			} else {
+				v.NextStep = st.Name
+			}
+		}
 	}
 	if !j.StartedAt.IsZero() {
 		t := j.StartedAt

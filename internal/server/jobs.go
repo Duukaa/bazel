@@ -12,6 +12,7 @@ import (
 	"github.com/beroni/bazel/internal/config"
 	"github.com/beroni/bazel/internal/gh"
 	"github.com/beroni/bazel/internal/store"
+	"github.com/beroni/bazel/internal/workspace"
 )
 
 // State é o ciclo de vida de um review na fila.
@@ -23,6 +24,10 @@ const (
 	StateDone     State = "done"
 	StateFailed   State = "failed"
 	StateCanceled State = "canceled"
+	// StatePaused é a pipeline que chegou num passo `pause`: rodou o que vinha
+	// antes, o clone continua de pé e ela espera você ler e mandar seguir. Não
+	// é um fim — o job volta para a fila quando você continua.
+	StatePaused State = "paused"
 )
 
 // maxJobs limita o histórico em memória. Os reviews que interessam já estão
@@ -84,6 +89,12 @@ type Job struct {
 	pubChoice config.Choice
 	stepBase  int
 
+	// keptDir é o clone que sobreviveu a uma parada, e cont é por onde a
+	// pipeline recomeça. Enquanto o job está pausado o Manager é o dono dessa
+	// pasta: quem abandona o job leva o clone junto.
+	keptDir string
+	cont    *agent.Cont
+
 	// logs é a janela do que os agentes escreveram; logSeq é o próximo
 	// número de linha e dropped conta o que já saiu pela frente da janela.
 	logs    []logLine
@@ -124,15 +135,21 @@ type publishInput struct {
 	Body string
 }
 
-// publishInputFor monta o que o agente de post recebe. Sem achado desmarcado
-// é o review como está; com algum, o corpo perde esses achados e o agente
-// ganha uma cópia do arquivo já sem eles em publish/, porque a skill de post
-// lê o arquivo, não o prompt.
-func (m *Manager) publishInputFor(path, body string, skip []int) (*publishInput, error) {
-	if len(skip) == 0 {
+// publishInputFor monta o que o agente de post recebe. Sem achado desmarcado e
+// com o relatório inteiro publicável é o review como está; se algum achado saiu
+// ou se a pipeline tinha passo que não vai ao PR, o agente ganha uma cópia do
+// arquivo já aparado em publish/, porque a skill de post lê o arquivo, não o
+// prompt.
+//
+// trimmed diz que o corpo recebido já não é o que está em path — é o que
+// obriga a cópia mesmo sem achado desmarcado nenhum.
+func (m *Manager) publishInputFor(path, body string, skip []int, trimmed bool) (*publishInput, error) {
+	if len(skip) == 0 && !trimmed {
 		return &publishInput{Path: path, Body: body}, nil
 	}
-	body = store.DropFindings(body, skip)
+	if len(skip) > 0 {
+		body = store.DropFindings(body, skip)
+	}
 	copyPath, err := store.SavePublishCopy(m.reviewsDir, path, body)
 	if err != nil {
 		return nil, fmt.Errorf("could not write the review without the unticked findings: %w", err)
@@ -160,6 +177,10 @@ type Manager struct {
 	order []string
 	seq   int
 
+	// keep repete o --keep: com ele ligado o clone de um review sobrevive ao
+	// fim dele, e o Manager não pode apagar o que a pessoa pediu para guardar.
+	keep bool
+
 	// limits é a última leitura da cota do Claude. Não pertence a job
 	// nenhum: é da máquina, e vale para a página inteira.
 	limitsMu sync.RWMutex
@@ -184,6 +205,7 @@ func NewManager(ctx context.Context, cfg *config.Config, reviewsDir string, conc
 		ctx:        ctx,
 		queue:      make(chan *Job, 256),
 		jobs:       map[string]*Job{},
+		keep:       keep,
 	}
 	for range concurrency {
 		go m.worker()
@@ -207,7 +229,7 @@ func (m *Manager) Enqueue(pr gh.PR, mine bool, choice config.Choice) (jobView, e
 	for _, id := range m.order {
 		j := m.jobs[id]
 		if j.PR.Key() == pr.Key() && j.Choice.Name == choice.Name &&
-			(j.State == StateQueued || j.State == StateRunning) {
+			(j.State == StateQueued || j.State == StateRunning || j.State == StatePaused) {
 			v := j.view(false)
 			m.mu.Unlock()
 			return v, nil
@@ -215,8 +237,14 @@ func (m *Manager) Enqueue(pr gh.PR, mine bool, choice config.Choice) (jobView, e
 	}
 	m.seq++
 	steps := make([]jobStep, 0, len(choice.Steps))
-	for _, name := range choice.StepNames() {
-		steps = append(steps, jobStep{Name: name, State: StateQueued})
+	for _, st := range choice.Steps {
+		// O passo `publish` não ganha linha própria: quem aparece na tela é o
+		// agente de publicação, que entra no fim da lista quando chega a vez
+		// dele — e é o mesmo caminho do botão de publicar.
+		if st.Reserved == config.StepPublish {
+			continue
+		}
+		steps = append(steps, jobStep{Name: st.Name, State: StateQueued})
 	}
 	job := &Job{
 		ID:       fmt.Sprintf("j%d", m.seq),
@@ -278,8 +306,13 @@ func (m *Manager) run(job *Job) {
 		return
 	}
 	job.State = StateRunning
-	job.StartedAt = time.Now()
+	// Retomando, o relógio é o do review inteiro: a pausa é tempo de gente
+	// lendo, e zerar aqui faria a pipeline parecer mais rápida do que foi.
+	if job.StartedAt.IsZero() {
+		job.StartedAt = time.Now()
+	}
 	job.cancel = cancel
+	cont := job.cont
 	m.mu.Unlock()
 	m.publish(job)
 
@@ -288,9 +321,12 @@ func (m *Manager) run(job *Job) {
 		res agent.Result
 		err error
 	)
-	if job.publish != nil {
+	switch {
+	case job.publish != nil:
 		res, err = m.runner.Publish(ctx, job.PR, job.pubChoice, job.publish.Path, job.publish.Body, onEvent)
-	} else {
+	case cont != nil:
+		res, err = m.runner.Continue(ctx, job.PR, job.Choice, *cont, onEvent)
+	default:
 		res, err = m.runner.Review(ctx, job.PR, job.Choice, onEvent)
 	}
 	if err != nil {
@@ -310,6 +346,13 @@ func (m *Manager) run(job *Job) {
 			state = StateCanceled
 		}
 		m.finish(job, state, err.Error())
+		return
+	}
+
+	// Parou num `pause`: o clone fica, o worker sai, e o job espera você ler o
+	// que saiu e mandar continuar.
+	if res.StoppedAt >= 0 && job.Choice.Steps[res.StoppedAt].Reserved == config.StepPause {
+		m.pauseJob(job, res)
 		return
 	}
 
@@ -355,8 +398,98 @@ func (m *Manager) run(job *Job) {
 	job.FinishedAt = time.Now()
 	job.Cloning = false
 	job.cancel = nil
+	job.cont = nil
+	// A pipeline acabou: o clone que ela vinha carregando entre as paradas já
+	// não serve a ninguém.
+	publicar := res.StoppedAt >= 0 && job.Choice.Steps[res.StoppedAt].Reserved == config.StepPublish
+	m.discardCloneLocked(job)
 	m.mu.Unlock()
 	m.publish(job)
+
+	// Passo `publish`: é o mesmo caminho do botão — o agente de publicação
+	// entra no fim deste card com o relatório que acabou de ser salvo. A
+	// diferença é só quem apertou, e por isso ele vem sempre depois de um
+	// `pause`, com você tendo lido.
+	if publicar && saveErr == nil {
+		if _, err := m.PublishWithAgent(job.ID, nil); err != nil {
+			m.mu.Lock()
+			job.PostErr = err.Error()
+			m.mu.Unlock()
+			m.publish(job)
+		}
+	}
+}
+
+// pauseJob guarda o que já rodou e para o job, liberando o worker. O clone não
+// é apagado: é dentro dele que o resto da pipeline continua, e clonar de novo
+// daria outro código — os passos já corridos falariam de outro repositório.
+func (m *Manager) pauseJob(job *Job, res agent.Result) {
+	m.mu.Lock()
+	job.Result = res
+	job.keptDir = res.Workdir
+	job.cont = &agent.Cont{From: res.StoppedAt + 1, Workdir: res.Workdir, Steps: res.Steps}
+	if res.StoppedAt < len(job.Steps) {
+		job.Steps[res.StoppedAt].State = StatePaused
+	}
+	job.State = StatePaused
+	job.Cloning = false
+	job.cancel = nil
+	job.Live = agent.Usage{}
+	m.mu.Unlock()
+	m.publish(job)
+}
+
+// Continue solta uma pipeline parada: ela volta para a fila e recomeça do passo
+// seguinte ao `pause`, dentro do mesmo clone.
+func (m *Manager) Continue(id string) (jobView, error) {
+	m.mu.Lock()
+	job, ok := m.jobs[id]
+	if !ok {
+		m.mu.Unlock()
+		return jobView{}, fmt.Errorf("job %q does not exist", id)
+	}
+	if job.State != StatePaused {
+		m.mu.Unlock()
+		return jobView{}, errors.New("that review is not waiting on you")
+	}
+	if job.cont == nil {
+		m.mu.Unlock()
+		return jobView{}, errors.New("that review has nothing left to run")
+	}
+	// A linha da pausa deixa de estar esperando: quem espera agora é a fila.
+	if i := job.cont.From - 1; i >= 0 && i < len(job.Steps) {
+		job.Steps[i].State = StateDone
+	}
+	job.State = StateQueued
+	job.QueuedAt = time.Now()
+	job.Err = ""
+	m.mu.Unlock()
+
+	select {
+	case m.queue <- job:
+	default:
+		m.mu.Lock()
+		job.State = StatePaused
+		m.mu.Unlock()
+		return m.mustView(id), errors.New("queue is full — wait for the reviews in flight")
+	}
+	m.publish(job)
+	return m.mustView(id), nil
+}
+
+// discardCloneLocked apaga o clone que uma parada deixou de pé. Com --keep
+// ligado ele fica: guardar o clone foi o que a pessoa pediu na linha de
+// comando. Chamar com o lock do Manager seguro.
+func (m *Manager) discardCloneLocked(job *Job) {
+	if job.keptDir == "" {
+		return
+	}
+	dir := job.keptDir
+	job.keptDir = ""
+	if m.keep {
+		return
+	}
+	(&workspace.Workspace{Dir: dir}).Remove()
 }
 
 // failPublish devolve ao card o review que ele já tinha: a publicação falhou
@@ -454,6 +587,10 @@ func (m *Manager) finish(job *Job, state State, errMsg string) {
 	job.FinishedAt = time.Now()
 	job.Cloning = false
 	job.cancel = nil
+	job.cont = nil
+	// Falhou ou foi cancelado: o clone que a parada segurava não espera mais
+	// ninguém.
+	m.discardCloneLocked(job)
 	m.mu.Unlock()
 	m.publish(job)
 }
@@ -496,6 +633,9 @@ func (m *Manager) Log(id string, from int) (logView, bool) {
 		Next:    job.logSeq,
 		Dropped: job.dropped,
 		Live:    job.State == StateQueued || job.State == StateRunning,
+		// Pausado nada escreve — a página para de pedir e volta a pedir
+		// sozinha quando o job sai da pausa e republica.
+
 	}
 	for _, l := range job.logs {
 		if l.Seq >= from {
@@ -526,6 +666,9 @@ func (m *Manager) Remove(id string) error {
 		job.State = StateCanceled
 		job.FinishedAt = time.Now()
 	}
+	// Tirar da tela uma pipeline parada é abandoná-la: o clone que ela
+	// segurava sai junto, senão fica uma pasta temporária órfã por review.
+	m.discardCloneLocked(job)
 	delete(m.jobs, id)
 	for i, other := range m.order {
 		if other == id {
@@ -573,6 +716,16 @@ func (m *Manager) Cancel(id string) error {
 			cancel()
 		}
 		return nil
+	case StatePaused:
+		// Parada, não há processo para matar: cancelar é desistir do resto da
+		// pipeline. O que já rodou continua na tela; o clone, não.
+		job.State = StateCanceled
+		job.FinishedAt = time.Now()
+		job.cont = nil
+		m.discardCloneLocked(job)
+		m.mu.Unlock()
+		m.publish(job)
+		return nil
 	default:
 		m.mu.Unlock()
 		return fmt.Errorf("that review has already finished")
@@ -614,12 +767,23 @@ func (m *Manager) PublishWithAgent(id string, skip []int) (jobView, error) {
 		m.mu.Unlock()
 		return jobView{}, errors.New("that review was not saved to disk — there is nothing to publish")
 	}
+	// Agente cuja saída não é review não tem caminho para o PR. A interface
+	// já esconde o botão; isto é o que segura um POST vindo de outro lugar.
+	if !job.Choice.Publishable {
+		m.mu.Unlock()
+		return jobView{}, fmt.Errorf("what %q produces does not go to the PR", job.Choice.Name)
+	}
 	choice := m.cfg.PostChoice()
 	if len(choice.Steps) == 0 {
 		m.mu.Unlock()
 		return jobView{}, config.ErrNoAgents
 	}
-	in, err := m.publishInputFor(job.SavedTo, job.Result.Body, skip)
+	body, trimmed, err := agent.PublishableBody(job.Result, job.Choice)
+	if err != nil {
+		m.mu.Unlock()
+		return jobView{}, err
+	}
+	in, err := m.publishInputFor(job.SavedTo, body, skip, trimmed)
 	if err != nil {
 		m.mu.Unlock()
 		return jobView{}, err
@@ -664,7 +828,7 @@ func (m *Manager) PublishSaved(pr gh.PR, mine bool, path, body string, skip []in
 	if strings.TrimSpace(path) == "" {
 		return jobView{}, errors.New("no review file to publish")
 	}
-	in, err := m.publishInputFor(path, body, skip)
+	in, err := m.publishInputFor(path, body, skip, false)
 	if err != nil {
 		return jobView{}, err
 	}
@@ -737,11 +901,22 @@ func (m *Manager) Post(ctx context.Context, id string, skip []int) (jobView, err
 		m.mu.Unlock()
 		return jobView{}, fmt.Errorf("that review was already published")
 	}
+	if !job.Choice.Publishable {
+		m.mu.Unlock()
+		return jobView{}, fmt.Errorf("what %q produces does not go to the PR", job.Choice.Name)
+	}
 	res := job.Result
-	res.Body = store.DropFindings(res.Body, skip)
+	// Colar como comentário é o mesmo destino por outra porta: da pipeline vai
+	// só o que é publicável, igual ao caminho do agente de post.
+	body, _, err := agent.PublishableBody(res, job.Choice)
+	if err != nil {
+		m.mu.Unlock()
+		return jobView{}, err
+	}
+	res.Body = store.DropFindings(body, skip)
 	m.mu.Unlock()
 
-	err := gh.Comment(ctx, res.PR.Repo, res.PR.Number, store.CommentBody(res))
+	err = gh.Comment(ctx, res.PR.Repo, res.PR.Number, store.CommentBody(res))
 
 	if err == nil {
 		_ = store.MarkPosted(m.reviewsDir, res.PR.Key())

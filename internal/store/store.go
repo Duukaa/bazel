@@ -105,9 +105,13 @@ func sanitize(s string) string {
 // review depois de o servidor ter sido reiniciado: sem eles, um review salvo é
 // só texto — não dá para publicá-lo no PR de onde veio.
 type Entry struct {
-	Name    string    `json:"name"`
-	Title   string    `json:"title"`
-	Repo    string    `json:"repo,omitempty"`
+	Name  string `json:"name"`
+	Title string `json:"title"`
+	Repo  string `json:"repo,omitempty"`
+	// Agent é quem produziu este review, lido do cabeçalho do arquivo. É o que
+	// permite, uma sessão depois, saber se o que está aqui pode ir ao PR — um
+	// relatório de história salvo em disco continua não sendo um review.
+	Agent   string    `json:"agent,omitempty"`
 	Number  int       `json:"number,omitempty"`
 	ModTime time.Time `json:"mod_time"`
 	Size    int64     `json:"size"`
@@ -132,11 +136,12 @@ func List(dir string) ([]Entry, error) {
 		if err != nil {
 			continue
 		}
-		title := heading(filepath.Join(dir, it.Name()))
+		title, agent := header(filepath.Join(dir, it.Name()))
 		repo, number := PRFromTitle(title)
 		out = append(out, Entry{
 			Name:    it.Name(),
 			Title:   title,
+			Agent:   agent,
 			Repo:    repo,
 			Number:  number,
 			ModTime: info.ModTime(),
@@ -164,13 +169,26 @@ func Read(dir, name string) (string, error) {
 	return string(data), nil
 }
 
-// heading lê o título do review (a primeira linha "# ..."), sem carregar o
-// arquivo inteiro.
 // Heading é o título de um review já lido — a primeira linha "# ...".
 func Heading(file string) string {
 	for _, line := range strings.SplitN(file, "\n", 6) {
 		if line = strings.TrimSpace(line); strings.HasPrefix(line, "# ") {
 			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
+		}
+	}
+	return ""
+}
+
+// AgentOf é o agente que escreveu um review já lido — a linha "- Agent: ..."
+// do cabeçalho. Vazio quando o arquivo não diz.
+func AgentOf(file string) string {
+	for _, line := range strings.SplitN(file, "\n", 16) {
+		line = strings.TrimSpace(line)
+		if line == "---" {
+			return ""
+		}
+		if strings.HasPrefix(line, "- Agent: ") {
+			return AgentFromLine(line)
 		}
 	}
 	return ""
@@ -201,17 +219,38 @@ func ReviewBody(file string) string {
 	return strings.TrimSpace(Unwrap(file))
 }
 
-func heading(path string) string {
+// header lê o título e o agente de um review salvo, sem carregar o arquivo
+// inteiro: são as duas coisas que a listagem precisa de dentro dele.
+func header(path string) (title, agent string) {
 	f, err := os.Open(path)
 	if err != nil {
-		return ""
+		return "", ""
 	}
 	defer f.Close()
 	sc := bufio.NewScanner(f)
-	for i := 0; sc.Scan() && i < 5; i++ {
-		if line := strings.TrimSpace(sc.Text()); strings.HasPrefix(line, "# ") {
-			return strings.TrimSpace(strings.TrimPrefix(line, "# "))
+	// O cabeçalho do Save tem meia dúzia de linhas e acaba no "---"; parar ali
+	// é o que evita varrer um review de 2 mil linhas atrás de dois campos.
+	for i := 0; sc.Scan() && i < 15; i++ {
+		line := strings.TrimSpace(sc.Text())
+		switch {
+		case line == "---":
+			return title, agent
+		case title == "" && strings.HasPrefix(line, "# "):
+			title = strings.TrimSpace(strings.TrimPrefix(line, "# "))
+		case agent == "" && strings.HasPrefix(line, "- Agent: "):
+			agent = AgentFromLine(line)
 		}
 	}
-	return ""
+	return title, agent
+}
+
+// AgentFromLine tira o nome da escolha da linha "- Agent: ..." do cabeçalho.
+// Numa pipeline o Save escreve também o tempo de cada passo depois de um
+// travessão; o nome é o que vem antes dele.
+func AgentFromLine(line string) string {
+	v := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(line), "- Agent:"))
+	if name, _, ok := strings.Cut(v, " — "); ok {
+		return strings.TrimSpace(name)
+	}
+	return v
 }

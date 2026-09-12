@@ -552,3 +552,95 @@ func TestUsageParcialChegaDuranteOReview(t *testing.T) {
 		t.Errorf("o resultado devia ficar com o total fechado: %+v", res.Usage)
 	}
 }
+
+// Numa pipeline que junta história e review, a tela mostra as duas e o PR
+// recebe só o review. É o ponto inteiro de marcar um agente como não-publicável.
+func TestPublishableBody(t *testing.T) {
+	steps := []StepResult{
+		{Name: "history-pr", Body: "48 commits, 3 rodadas de review"},
+		{Name: "review-fleet", Body: "- token guardado no cliente"},
+	}
+	full, err := joinSteps(steps)
+	if err != nil {
+		t.Fatalf("joinSteps: %v", err)
+	}
+	res := Result{Body: full, Steps: steps}
+
+	t.Run("só o passo publicável sobe", func(t *testing.T) {
+		choice := config.Choice{Name: "história e review", Pipeline: true, Publishable: true, Steps: []config.ResolvedAgent{
+			{Name: "history-pr", Publishable: false},
+			{Name: "review-fleet", Publishable: true},
+		}}
+		body, trimmed, err := PublishableBody(res, choice)
+		if err != nil {
+			t.Fatalf("PublishableBody: %v", err)
+		}
+		if !trimmed {
+			t.Error("algo ficou de fora — o arquivo em disco já não serve para publicar")
+		}
+		if strings.Contains(body, "48 commits") {
+			t.Errorf("a história não podia ir ao PR: %q", body)
+		}
+		if !strings.Contains(body, "token guardado no cliente") {
+			t.Errorf("o review tinha de ir: %q", body)
+		}
+		// Sobrando um passo só, sai cru — sem o cabeçalho "## review-fleet",
+		// que só existe para separar passos.
+		if strings.Contains(body, "## review-fleet") {
+			t.Errorf("um passo só sai como sempre saiu: %q", body)
+		}
+	})
+
+	t.Run("tudo publicável é o relatório inteiro", func(t *testing.T) {
+		choice := config.Choice{Name: "tudo", Pipeline: true, Publishable: true, Steps: []config.ResolvedAgent{
+			{Name: "history-pr", Publishable: true},
+			{Name: "review-fleet", Publishable: true},
+		}}
+		body, trimmed, err := PublishableBody(res, choice)
+		if err != nil {
+			t.Fatalf("PublishableBody: %v", err)
+		}
+		if trimmed || body != full {
+			t.Error("sem nada aparado, o que vai ao PR é o relatório como está")
+		}
+	})
+
+	t.Run("nada publicável é erro", func(t *testing.T) {
+		choice := config.Choice{Name: "só história", Steps: []config.ResolvedAgent{
+			{Name: "history-pr", Publishable: false},
+			{Name: "review-fleet", Publishable: false},
+		}}
+		if _, _, err := PublishableBody(res, choice); err == nil {
+			t.Error("sem passo publicável não há o que publicar")
+		}
+	})
+}
+
+// Skill embarcada precisa existir em disco para o Claude Code achá-la, e o
+// lugar dela é o clone. Sem clone ela não tem onde existir, e escrevê-la na
+// pasta de quem rodou o Bazel seria sujar um projeto alheio.
+func TestBuiltinPrecisaDoClone(t *testing.T) {
+	comClone := config.Choice{Name: "publicar", Steps: []config.ResolvedAgent{
+		{Name: "bazel-post-report", Task: "/bazel-post-report {{review_file}}", Checkout: true},
+	}}
+	if got := builtinSemClone(comClone); got != "" {
+		t.Errorf("com checkout ligado não há o que reclamar, veio %q", got)
+	}
+	if !usaBuiltin(comClone) {
+		t.Error("a task chama uma skill embarcada")
+	}
+
+	semClone := config.Choice{Name: "publicar", Steps: []config.ResolvedAgent{
+		{Name: "bazel-post-report", Task: "/bazel-post-report {{review_file}}", Checkout: false},
+	}}
+	if got := builtinSemClone(semClone); got != "bazel-post-report" {
+		t.Errorf("sem checkout a skill não tem onde ser escrita: %q", got)
+	}
+
+	propria := config.Choice{Name: "publicar", Steps: []config.ResolvedAgent{
+		{Name: "post-report", Task: "/post-report {{review_file}}", Checkout: false},
+	}}
+	if usaBuiltin(propria) || builtinSemClone(propria) != "" {
+		t.Error("a skill do usuário não é embarcada — checkout: false nela é escolha dele")
+	}
+}

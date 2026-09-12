@@ -178,8 +178,8 @@ calls, a **make default** button (the first one runs when you don't choose) and
 ```
 review-fleet      default              ✓ /review-fleet
 review-fleet-post ⇧ publishes          ✓ /review-fleet
-serial-fleet      pipeline             ✓ /senior-code-reviewer  ✓ /exploit-digger
-post-report       used when publishing                          ✗ /post-report
+serial-fleet      pipeline             ✓ /senior-code-reviewer  ✗ /exploit-digger
+bazel-post-report used when publishing ✓ /bazel-post-report
 ```
 
 The `✗` is the warning that matters: that agent calls a skill that is **not on
@@ -320,8 +320,8 @@ Every review lands in three places, in this order:
 Three ways in, from the most deliberate to the most direct.
 
 **1. Read, then publish** (the default). Run a review, read it on screen, then
-click **publish inline review**. That runs the `post_agent` — the `post-report`
-skill — over a clone of the PR, with the markdown file you just read in the
+click **publish inline review**. That runs the `post_agent` — the
+`bazel-post-report` skill, which ships inside the binary — over a clone of the PR, with the markdown file you just read in the
 prompt and the instruction **not to redo the review**: it publishes what is in
 the file, with inline comments on the right lines, 👍 on what is already flagged
 in the PR, and an all-clear when there is nothing to say. It runs **in the
@@ -362,6 +362,12 @@ warns you first.
 
 ## Configuration
 
+Everything the page changes — repos, agents, pipelines, the default — is written
+to one file. The dialog no longer prints it at you: at the bottom there is **save
+config.yaml**, which downloads it, and a collapsed *show the file* if you want to
+read it. Dropping that file at the same path on another machine brings Bazel up
+already configured.
+
 `~/.bazel/config.yaml` (or `$BAZEL_HOME/config.yaml`):
 
 ```yaml
@@ -392,13 +398,13 @@ agent:
 # installed skills. The first one is the default.
 agents: []
 
-# Sequences run over the same clone.
+# Sequences run over the same clone. Built in the page, under "config".
 pipelines: []
 
 # Who takes an already-read review to the PR.
 post_agent:
-  name: post-report
-  task: /post-report {{review_file}}
+  name: bazel-post-report
+  task: /bazel-post-report {{review_file}}
   posts: true
 ```
 
@@ -431,11 +437,46 @@ pipelines:
   - name: serial-fleet
     description: the three lenses one at a time, each in its own process
     steps: [senior-code-reviewer, exploit-digger, lazy-senior-dev]
+  # `pause` and `publish` are steps Bazel runs itself: read before it goes out.
+  - name: read before sending
+    steps: [review-fleet, pause, publish]
+
+# Which choice runs when you don't pick one. Empty = the first in the selector.
+default: serial-fleet
 ```
 
 A **pipeline** chains agents by name, in order, over the same clone; the report
 comes out with one section per step. A step pointing at an agent that doesn't
 exist is skipped.
+
+Two steps are not agents — Bazel runs them itself:
+
+| Step | What it does |
+|---|---|
+| `pause` | Stops there. The clone stays up, the worker goes back to the queue, and the card waits with the report so far on screen and a **continue** button. |
+| `publish` | Takes the report to the PR with the publishing agent — the same one the **publish inline review** button uses. Has to be the last step. |
+
+That is what `review-fleet → pause → publish` is for: the fleet runs, you read
+what it found, and only then does anything reach the PR. Continuing resumes
+**inside the same clone** — cloning again would give you a different commit, and
+the steps that already ran would be talking about another repository.
+
+While a pipeline is paused it holds no worker: other reviews keep running. Give
+up with **stop here** and what you read stays on screen; the clone goes.
+
+You build one in the page rather than here: under **pipelines** in the config
+dialog, click the agents in the order they should run, drag them around with
+`↑ ↓`, name it and create. Only agents already in the list can be steps — that
+is what guarantees each step arrives with its prompt, its command and its
+publishing flag already settled. The same agent twice in one sequence is refused:
+it would be the same work twice over the same clone. The rules around `pause` and
+`publish` are enforced on the way in, not at run time: neither can open a
+pipeline, a pause never follows a pause nor closes the sequence, `publish` runs
+at most once and always last, and it needs something publishable before it.
+
+`default:` names the choice that runs when you don't pick one. A pipeline can be
+it — the selector lists agents before pipelines, so being first is not something
+a pipeline could win by position. **make default** writes this field.
 
 With no agents at all, the **review** button stays disabled and the page tells
 you what is missing. If you wrote your own `agent.prompt` and have no `agents:`,

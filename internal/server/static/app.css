@@ -415,3 +415,29 @@ main.no-prs .burger span { background: var(--accent); }
 /* O gasto do review: tokens e custo, no card e no fim do relatório. */
 .tokens { color: var(--dim); font-variant-numeric: tabular-nums; }
 .tokens-foot { margin-top: 6px; font-variant-numeric: tabular-nums; }
+
+/* --- montador de pipeline --- */
+.pipe-builder { display: flex; flex-direction: column; gap: 8px; margin-bottom: 12px; }
+.pipe-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; min-height: 28px;
+  padding: 7px 9px; border: 1px dashed var(--line); border-radius: 6px; }
+.pipe-step { display: inline-flex; align-items: center; gap: 5px; padding: 2px 4px 2px 8px;
+  border: 1px solid var(--line); border-radius: 5px; background: var(--panel-2); font-size: 12px; }
+.pipe-step .n { color: var(--dim); font-size: 10px; }
+.pipe-step button { background: none; border: 0; color: var(--dim); cursor: pointer;
+  font-size: 12px; padding: 0 2px; line-height: 1; }
+.pipe-step button:hover { color: var(--fg); }
+.pipe-step button:disabled { opacity: .3; cursor: default; }
+.pipe-arrow { color: var(--dim); font-size: 11px; }
+.pipe-pick { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.pipe-row { display: flex; gap: 8px; align-items: center; }
+.pipe-row input { flex: 1; min-width: 0; }
+
+/* --- salvar a configuração --- */
+#config-download { white-space: nowrap; }
+#config-raw { margin-top: 10px; }
+#config-raw summary { cursor: pointer; }
+#config-raw pre { margin-top: 8px; }
+.state.paused { color: var(--warn); }
+.step.paused { color: var(--warn); }
+.pipe-step.reserved { border-style: dashed; color: var(--warn); }
+.pipe-sep { color: var(--dim); padding: 0 2px; }

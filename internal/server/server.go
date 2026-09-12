@@ -113,6 +113,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/jobs/{id}/cancel", s.handleCancel)
 	mux.HandleFunc("POST /api/jobs/{id}/post", s.handlePost)
 	mux.HandleFunc("POST /api/jobs/{id}/publish", s.handlePublish)
+	mux.HandleFunc("POST /api/jobs/{id}/continue", s.handleContinue)
 	mux.HandleFunc("GET /api/events", s.handleEvents)
 	mux.HandleFunc("GET /api/repos", s.handleReposList)
 	mux.HandleFunc("POST /api/repos", s.handleRepoAdd)
@@ -121,6 +122,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/agents", s.handleAgentAdd)
 	mux.HandleFunc("DELETE /api/agents/{name}", s.handleAgentRemove)
 	mux.HandleFunc("POST /api/agents/{name}/default", s.handleAgentDefault)
+	mux.HandleFunc("POST /api/agents/{name}/publishable", s.handleAgentPublishable)
+	mux.HandleFunc("POST /api/pipelines", s.handlePipelineAdd)
+	mux.HandleFunc("DELETE /api/pipelines/{name}", s.handlePipelineRemove)
+	mux.HandleFunc("GET /api/config/file", s.handleConfigDownload)
 	mux.HandleFunc("GET /api/config", s.handleConfig)
 	mux.HandleFunc("GET /api/skills", s.handleSkills)
 	mux.HandleFunc("GET /api/reviews", s.handleSavedList)
@@ -514,6 +519,17 @@ func (s *Server) handlePublish(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, view)
 }
 
+// handleContinue solta uma pipeline que parou para você ler: ela volta para a
+// fila e recomeça do passo seguinte, dentro do mesmo clone.
+func (s *Server) handleContinue(w http.ResponseWriter, r *http.Request) {
+	view, err := s.jobs.Continue(r.PathValue("id"))
+	if err != nil {
+		writeErr(w, http.StatusConflict, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, view)
+}
+
 func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
@@ -686,6 +702,83 @@ func (s *Server) handleAgentDefault(w http.ResponseWriter, r *http.Request) {
 	s.writeAgents(w, http.StatusOK, nil)
 }
 
+// handleAgentPublishable liga ou desliga a ida ao PR da saída de um agente.
+// É o tique do painel: nem toda skill produz review, e a que não produz não
+// tem por que oferecer um botão de publicar.
+func (s *Server) handleAgentPublishable(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Publishable bool `json:"publishable"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	s.cfgMu.Lock()
+	err := s.cfg.SetAgentPublishable(r.PathValue("name"), req.Publishable)
+	if err == nil {
+		err = s.cfg.Save()
+	}
+	s.cfgMu.Unlock()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.writeAgents(w, http.StatusOK, nil)
+}
+
+// handlePipelineAdd encadeia agentes da lista numa sequência sobre o mesmo
+// clone. Os passos vêm por nome de agente — a página só deixa escolher entre
+// os que existem, e o config recusa o resto.
+func (s *Server) handlePipelineAdd(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Name        string   `json:"name"`
+		Description string   `json:"description"`
+		Steps       []string `json:"steps"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<16)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, fmt.Errorf("invalid body: %w", err))
+		return
+	}
+	s.cfgMu.Lock()
+	p, err := s.cfg.AddPipeline(req.Name, req.Description, req.Steps)
+	if err == nil {
+		err = s.cfg.Save()
+	}
+	s.cfgMu.Unlock()
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err)
+		return
+	}
+	s.writeAgents(w, http.StatusCreated, map[string]any{"added": p.Name})
+}
+
+func (s *Server) handlePipelineRemove(w http.ResponseWriter, r *http.Request) {
+	s.cfgMu.Lock()
+	removed := s.cfg.RemovePipeline(r.PathValue("name"))
+	err := s.cfg.Save()
+	s.cfgMu.Unlock()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err)
+		return
+	}
+	s.writeAgents(w, http.StatusOK, map[string]any{"removed": removed})
+}
+
+// handleConfigDownload entrega o config.yaml como arquivo. É o que se leva
+// para outra máquina: repos, agentes e pipelines são a configuração inteira, e
+// copiá-la é mais rápido do que remontá-la clique a clique do outro lado.
+func (s *Server) handleConfigDownload(w http.ResponseWriter, r *http.Request) {
+	data, err := os.ReadFile(s.configPath)
+	if err != nil {
+		writeErr(w, http.StatusNotFound, fmt.Errorf("could not read %s", s.configPath))
+		return
+	}
+	w.Header().Set("Content-Type", "application/yaml; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="config.yaml"`)
+	w.Header().Set("Cache-Control", "no-store")
+	w.Write(data)
+}
+
 // writeAgents devolve a lista inteira depois de mexer nela: é o que a página
 // redesenha, do seletor à configuração.
 func (s *Server) writeAgents(w http.ResponseWriter, status int, extra map[string]any) {
@@ -727,10 +820,35 @@ func (s *Server) handleSavedList(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err)
 		return
 	}
-	if entries == nil {
-		entries = []store.Entry{}
+	out := make([]savedView, 0, len(entries))
+	for _, e := range entries {
+		out = append(out, savedView{Entry: e, Publishable: s.agentPublishes(e.Agent)})
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"dir": s.reviewsDir, "reviews": entries})
+	writeJSON(w, http.StatusOK, map[string]any{"dir": s.reviewsDir, "reviews": out})
+}
+
+// savedView é um review salvo mais o que só a configuração sabe dizer: se o
+// que está ali dentro pode ir ao PR.
+type savedView struct {
+	store.Entry
+	Publishable bool `json:"publishable"`
+}
+
+// agentPublishes diz se a saída de um agente pode ir ao PR. Agente que não
+// está mais na lista continua publicável: o review em disco sobrevive à
+// configuração, e um nome que o Bazel não reconhece mais não é motivo para
+// trancar um review que já foi lido e aprovado.
+func (s *Server) agentPublishes(name string) bool {
+	if strings.TrimSpace(name) == "" {
+		return true
+	}
+	s.cfgMu.Lock()
+	defer s.cfgMu.Unlock()
+	ch, err := s.cfg.ChoiceByName(name)
+	if err != nil {
+		return true
+	}
+	return ch.Publishable
 }
 
 func (s *Server) handleSavedOne(w http.ResponseWriter, r *http.Request) {
@@ -752,23 +870,47 @@ func (s *Server) handleSavedOne(w http.ResponseWriter, r *http.Request) {
 // levá-lo ao PR tem de sobreviver junto — antes, fechar o Bazel antes de
 // publicar deixava o texto lá e nenhuma forma de usá-lo.
 
+// savedReview é um review lido do disco, pronto para ir ao PR: o pull request
+// de onde ele veio, onde o arquivo está, o corpo e quem o escreveu.
+type savedReview struct {
+	PR    gh.PR
+	Path  string
+	Body  string
+	Agent string
+}
+
 // savedPR relê um review salvo e devolve o PR de onde ele veio, junto com o
-// caminho e o corpo. O PR é buscado no GitHub: o arquivo guarda o cabeçalho,
-// não o estado atual dele.
-func (s *Server) savedPR(ctx context.Context, name string) (gh.PR, string, string, error) {
+// caminho, o corpo e o agente. O PR é buscado no GitHub: o arquivo guarda o
+// cabeçalho, não o estado atual dele.
+func (s *Server) savedPR(ctx context.Context, name string) (savedReview, error) {
 	file, err := store.Read(s.reviewsDir, name)
 	if err != nil {
-		return gh.PR{}, "", "", err
+		return savedReview{}, err
 	}
 	repo, number := store.PRFromTitle(store.Heading(file))
 	if repo == "" {
-		return gh.PR{}, "", "", fmt.Errorf("could not tell which PR %q belongs to", name)
+		return savedReview{}, fmt.Errorf("could not tell which PR %q belongs to", name)
 	}
 	pr, err := gh.Get(ctx, repo, number)
 	if err != nil {
-		return gh.PR{}, "", "", err
+		return savedReview{}, err
 	}
-	return pr, filepath.Join(s.reviewsDir, name), store.ReviewBody(file), nil
+	return savedReview{
+		PR:    pr,
+		Path:  filepath.Join(s.reviewsDir, name),
+		Body:  store.ReviewBody(file),
+		Agent: store.AgentOf(file),
+	}, nil
+}
+
+// refusePublish barra o que não é review. Vale para o salvo como vale para o
+// job recém-terminado: a história de um PR não vira comentário nele.
+func (s *Server) refusePublish(w http.ResponseWriter, sr savedReview) bool {
+	if s.agentPublishes(sr.Agent) {
+		return false
+	}
+	writeErr(w, http.StatusBadRequest, fmt.Errorf("what %q produces does not go to the PR", sr.Agent))
+	return true
 }
 
 // handleSavedPublish roda o agente de publicação sobre um review salvo.
@@ -778,12 +920,16 @@ func (s *Server) handleSavedPublish(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	pr, path, body, err := s.savedPR(r.Context(), r.PathValue("name"))
+	sr, err := s.savedPR(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	view, err := s.jobs.PublishSaved(pr, strings.EqualFold(pr.Author.Login, s.me), path, body, skip)
+	if s.refusePublish(w, sr) {
+		return
+	}
+	pr := sr.PR
+	view, err := s.jobs.PublishSaved(pr, strings.EqualFold(pr.Author.Login, s.me), sr.Path, sr.Body, skip)
 	if err != nil {
 		writeErr(w, http.StatusConflict, err)
 		return
@@ -798,17 +944,20 @@ func (s *Server) handleSavedComment(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	pr, _, body, err := s.savedPR(r.Context(), r.PathValue("name"))
+	sr, err := s.savedPR(r.Context(), r.PathValue("name"))
 	if err != nil {
 		writeErr(w, http.StatusBadRequest, err)
 		return
 	}
-	if err := s.jobs.CommentSaved(r.Context(), pr, body, skip); err != nil {
+	if s.refusePublish(w, sr) {
+		return
+	}
+	if err := s.jobs.CommentSaved(r.Context(), sr.PR, sr.Body, skip); err != nil {
 		writeErr(w, http.StatusBadGateway, err)
 		return
 	}
 	s.invalidatePRs()
-	writeJSON(w, http.StatusOK, map[string]any{"posted": pr.Key()})
+	writeJSON(w, http.StatusOK, map[string]any{"posted": sr.PR.Key()})
 }
 
 // --- helpers ---
@@ -880,6 +1029,7 @@ func (s *Server) agentView(c config.Choice, instaladas []skills.Skill, publisher
 		"description": c.Description,
 		"pipeline":    c.Pipeline,
 		"posts":       c.Posts,
+		"publishable": c.Publishable,
 		"steps":       c.StepNames(),
 		"skills":      usadas,
 		// publisher sai do seletor de review: ele roda depois, na publicação.
@@ -904,9 +1054,9 @@ func (s *Server) installedSkills() (string, []skills.Skill) {
 		dir = skills.DefaultDir()
 	}
 	// As embarcadas entram na lista: elas viajam no binário, estão sempre
-	// disponíveis, e é a partir desta lista que a página deixa montar agentes.
-	// Uma skill de disco com o mesmo nome perde — dentro do clone quem o
-	// Claude Code vai achar é a do projeto, que é a embarcada.
+	// disponíveis, e é a partir desta lista que a página deixa montar agentes
+	// e pipelines. Uma skill de disco com o mesmo nome perde — dentro do clone
+	// quem o Claude Code vai achar é a do projeto, que é a embarcada.
 	list := skills.Builtin()
 	for _, s := range skills.List(dir) {
 		if !skills.IsBuiltin(s.Name) {

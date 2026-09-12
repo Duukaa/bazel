@@ -15,6 +15,7 @@ import (
 
 	"github.com/beroni/bazel/internal/config"
 	"github.com/beroni/bazel/internal/gh"
+	"github.com/beroni/bazel/internal/skills"
 	"github.com/beroni/bazel/internal/workspace"
 )
 
@@ -153,6 +154,19 @@ func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra 
 		workdir = ws.Dir
 	}
 
+	// Skill embarcada só existe dentro do binário; o Claude Code a acha em
+	// disco, no .claude/skills do diretório de trabalho. O lugar dela é o
+	// clone do PR: nasce e morre com ele, e a máquina de quem roda o Bazel
+	// não ganha nada em ~/.claude que ninguém pediu.
+	if step := builtinSemClone(choice); step != "" {
+		return Result{}, fmt.Errorf("`%s` runs a skill built into Bazel, which needs the PR clone to be found — turn checkout on for it, or point it at a skill of your own", step)
+	}
+	if workdir != "" && usaBuiltin(choice) {
+		if err := skills.Materialize(workdir); err != nil {
+			return Result{}, err
+		}
+	}
+
 	diff, truncated, err := r.material(ctx, pr, choice)
 	if err != nil {
 		return Result{}, err
@@ -222,6 +236,28 @@ func (r *Runner) run(ctx context.Context, pr gh.PR, choice config.Choice, extra 
 		Truncated: truncated,
 		Workdir:   workdir,
 	}, nil
+}
+
+// usaBuiltin diz se algum passo chama uma skill que veio no binário.
+func usaBuiltin(choice config.Choice) bool {
+	for _, s := range choice.Steps {
+		if skills.IsBuiltin(skills.TaskSkill(s.Task)) {
+			return true
+		}
+	}
+	return false
+}
+
+// builtinSemClone devolve o passo que chama uma skill embarcada sem ter clone
+// onde escrevê-la — sem diretório de trabalho do PR, ela não tem onde existir,
+// e escrevê-la na pasta de quem rodou o Bazel seria sujar um projeto alheio.
+func builtinSemClone(choice config.Choice) string {
+	for _, s := range choice.Steps {
+		if !s.Checkout && skills.IsBuiltin(skills.TaskSkill(s.Task)) {
+			return s.Name
+		}
+	}
+	return ""
 }
 
 // material baixa o que o review precisa antes de rodar qualquer passo. O diff

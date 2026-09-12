@@ -188,6 +188,24 @@ the repository where you version them, and Bazel follows the links; the list is
 read from disk every time you open the dialog, so installing a skill needs no
 restart.
 
+### The skill that ships inside Bazel
+
+One entry in that list is marked **in Bazel** and is never `✗`:
+`bazel-post-report`, the skill that takes a review you have read to the PR. It
+travels inside the binary and is written into the PR's throwaway clone —
+`.claude/skills/bazel-post-report/` — right before the agent runs, which is
+where Claude Code looks for a project's skills. Nothing is installed on your
+machine, and nothing is left behind when the clone goes.
+
+This is what makes **publish** true on a machine that has never installed a
+skill. Before it existed, the default `post_agent` called a `/post-report` that
+only some machines had; everywhere else the agent ran with explicit permission
+to write to the PR and no instructions at all.
+
+Your own publishing skill still wins whenever you want it: point `post_agent.task`
+at it, or build an agent out of it in the panel. A `post_agent` you have edited
+is never rewritten — only the old untouched default is migrated to the built-in.
+
 Everything the page does is written to `config.yaml`, and you can edit it by
 hand for what the page doesn't offer — another model, another executable, your
 own prompt template. See [Configuration](#configuration).

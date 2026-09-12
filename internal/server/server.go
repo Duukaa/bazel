@@ -867,8 +867,11 @@ func (s *Server) agentView(c config.Choice, instaladas []skills.Skill, publisher
 			continue
 		}
 		usadas = append(usadas, map[string]any{
-			"name":      name,
-			"installed": skills.Has(instaladas, name),
+			"name": name,
+			// Skill embarcada está sempre disponível: ela viaja no binário, e
+			// não há o que instalar nem como faltar.
+			"installed": skills.Has(instaladas, name) || skills.IsBuiltin(name),
+			"builtin":   skills.IsBuiltin(name),
 			"step":      step.Name,
 		})
 	}
@@ -900,7 +903,16 @@ func (s *Server) installedSkills() (string, []skills.Skill) {
 	if dir == "" {
 		dir = skills.DefaultDir()
 	}
-	list := skills.List(dir)
+	// As embarcadas entram na lista: elas viajam no binário, estão sempre
+	// disponíveis, e é a partir desta lista que a página deixa montar agentes.
+	// Uma skill de disco com o mesmo nome perde — dentro do clone quem o
+	// Claude Code vai achar é a do projeto, que é a embarcada.
+	list := skills.Builtin()
+	for _, s := range skills.List(dir) {
+		if !skills.IsBuiltin(s.Name) {
+			list = append(list, s)
+		}
+	}
 	if list == nil {
 		list = []skills.Skill{}
 	}

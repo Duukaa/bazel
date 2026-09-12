@@ -7,6 +7,7 @@ package skills
 
 import (
 	"bufio"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -20,6 +21,9 @@ type Skill struct {
 	// Dir é a pasta dela, útil quando o nome do diretório e o do frontmatter
 	// não batem.
 	Dir string `json:"dir"`
+	// Builtin marca a skill que veio dentro do binário do Bazel. Ela não está
+	// em lugar nenhum do disco até um review rodar, e está sempre disponível.
+	Builtin bool `json:"builtin,omitempty"`
 }
 
 // DefaultDir é onde o Claude Code guarda as skills do usuário.
@@ -69,12 +73,29 @@ func read(dir string) (Skill, bool) {
 	defer f.Close()
 
 	s := Skill{Dir: dir}
-	sc := bufio.NewScanner(f)
+	s.Name, s.Description = parseFrontmatter(f)
+	return s, true
+}
+
+// frontmatterOf lê o frontmatter de um SKILL.md já em memória — é como as
+// skills embarcadas no binário se descrevem, sem passar pelo disco. Sem `name`
+// no frontmatter, vale o nome da pasta.
+func frontmatterOf(content, fallback string) (name, description string) {
+	name, description = parseFrontmatter(strings.NewReader(content))
+	if name == "" {
+		name = fallback
+	}
+	return name, description
+}
+
+// parseFrontmatter lê o bloco YAML entre os dois `---` do topo. Só interessam
+// name e description: é o que a página mostra.
+func parseFrontmatter(r io.Reader) (name, description string) {
+	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 0, 64*1024), 1<<20)
 
 	if !sc.Scan() || strings.TrimSpace(sc.Text()) != "---" {
-		// Sem frontmatter o nome da pasta é o que temos.
-		return s, true
+		return "", ""
 	}
 
 	key := ""
@@ -87,7 +108,7 @@ func read(dir string) (Skill, bool) {
 		// quebradas em várias linhas no YAML.
 		if key != "" && (strings.HasPrefix(line, "  ") || strings.HasPrefix(line, "\t")) {
 			if key == "description" {
-				s.Description = strings.TrimSpace(s.Description + " " + strings.TrimSpace(line))
+				description = strings.TrimSpace(description + " " + strings.TrimSpace(line))
 			}
 			continue
 		}
@@ -100,12 +121,12 @@ func read(dir string) (Skill, bool) {
 		value = strings.TrimSpace(strings.Trim(strings.TrimSpace(value), `"'`))
 		switch key {
 		case "name":
-			s.Name = value
+			name = value
 		case "description":
-			s.Description = value
+			description = value
 		}
 	}
-	return s, true
+	return name, description
 }
 
 // TaskSkill devolve a skill que uma task invoca — o "/review-fleet" de

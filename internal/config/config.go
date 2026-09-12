@@ -194,8 +194,24 @@ func legacyArgs() []string {
 	return []string{"-p", "--allowedTools", "Read,Grep,Glob,Bash,Agent"}
 }
 
-// defaultPostAgent é quem publica um review já lido.
+// defaultPostAgent é quem publica um review já lido. A skill que ele chama vem
+// dentro do binário: publicar não pode depender de uma skill instalada na
+// máquina de quem escreveu o Bazel. Quem tem a sua própria troca o task aqui,
+// ou monta outro agente de publicação na página.
 func defaultPostAgent() AgentDef {
+	return AgentDef{
+		Name:        "bazel-post-report",
+		Description: "publishes the review you have just read, with inline comments",
+		Task:        "/bazel-post-report {{review_file}}",
+		Prompt:      publishPrompt,
+		Posts:       true,
+	}
+}
+
+// legacyPostAgent é o agente de publicação que o Bazel gravava antes da skill
+// embarcada — ele chamava a `/post-report` de ~/.claude/skills, que só existia
+// em quem a tivesse instalado.
+func legacyPostAgent() AgentDef {
 	return AgentDef{
 		Name:        "post-report",
 		Description: "publishes the review you have just read, with inline comments",
@@ -203,6 +219,28 @@ func defaultPostAgent() AgentDef {
 		Prompt:      publishPrompt,
 		Posts:       true,
 	}
+}
+
+// migratePostAgent troca a skill do agente de publicação padrão pela que vem
+// no binário. Só nome e task mudam: prompt, comando, checkout e timeout são
+// escolhas de quem editou o arquivo e sobrevivem. O que não pode sobreviver é
+// a task apontando para uma skill que esta máquina talvez nunca tenha tido —
+// era isso que fazia o botão de publicar disparar um agente sem instrução.
+//
+// Quem apontou o post_agent para outra coisa não é tocado, inclusive quem
+// aponta para a própria /post-report de propósito: só casa o padrão antigo,
+// nome e task exatos.
+func migratePostAgent(def AgentDef) AgentDef {
+	legacy := legacyPostAgent()
+	if strings.TrimSpace(def.Name) != legacy.Name || strings.TrimSpace(def.Task) != legacy.Task {
+		return def
+	}
+	novo := defaultPostAgent()
+	def.Name, def.Task = novo.Name, novo.Task
+	if d := strings.TrimSpace(def.Description); d == "" || d == legacy.Description {
+		def.Description = novo.Description
+	}
+	return def
 }
 
 // Default devolve a configuração inicial usada pelo "bazel init".
@@ -283,6 +321,9 @@ func Load() (*Config, error) {
 	if strings.TrimSpace(cfg.PostAgent.Name) == "" {
 		cfg.PostAgent = defaultPostAgent()
 	}
+	// Mesma ideia dos args: quem está com o padrão antigo ganha a skill
+	// embarcada, que funciona sem nada instalado.
+	cfg.PostAgent = migratePostAgent(cfg.PostAgent)
 	if cfg.MaxDiffBytes <= 0 {
 		cfg.MaxDiffBytes = Default().MaxDiffBytes
 	}

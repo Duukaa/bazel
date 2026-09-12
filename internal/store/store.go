@@ -31,6 +31,12 @@ func Save(dir string, res agent.Result) (string, error) {
 	fmt.Fprintf(&b, "- Author: @%s\n", res.PR.Author.Login)
 	fmt.Fprintf(&b, "- Branch: `%s`\n", res.PR.HeadRefName)
 	fmt.Fprintf(&b, "- URL: %s\n", res.PR.URL)
+	// O sha é o que deixa publicar com segurança depois: com commit novo no
+	// PR, as linhas se moveram e uma âncora `path:line` do review passa a
+	// apontar para o lugar errado. Quem publica compara este valor com o HEAD.
+	if res.PR.HeadRefOid != "" {
+		fmt.Fprintf(&b, "- Head sha: %s\n", res.PR.HeadRefOid)
+	}
 	fmt.Fprintf(&b, "- Diff: +%d −%d across %d file(s)\n", res.PR.Additions, res.PR.Deletions, res.PR.ChangedFiles)
 	fmt.Fprintf(&b, "- Reviewed at: %s (took %s)\n", time.Now().Format("2006-01-02 15:04"), res.Duration.Round(time.Second))
 	if res.Agent != "" {

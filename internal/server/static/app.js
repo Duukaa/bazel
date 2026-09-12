@@ -1443,7 +1443,7 @@ function renderSkillList() {
   box.innerHTML = '';
   $('#skills-dir').textContent = state.skillsDir ? '· ' + state.skillsDir : '';
   if (!state.skills.length) {
-    box.append(el('p', 'none', `nothing in ${state.skillsDir || '~/.claude/skills'} — with no skill installed there is no agent to build.`));
+    box.append(el('p', 'none', `nothing in ${state.skillsDir || '~/.claude/skills'} — install a skill there to build an agent out of it.`));
     return;
   }
   // As que já viraram agente vêm primeiro: são as que importam aqui.
@@ -1457,6 +1457,14 @@ function renderSkillList() {
   for (const sk of ordenadas) {
     const row = el('div', 'skill-row' + (usadas.has(sk.name) ? ' on' : ''));
     row.append(el('span', 'skill-name', '/' + sk.name));
+    if (sk.builtin) {
+      // Esta não está em disco: veio no binário e é escrita no clone antes de
+      // rodar. Dizer isso aqui é o que explica por que ela aparece numa
+      // máquina onde ninguém instalou skill nenhuma.
+      const t = el('span', 'tag', 'in Bazel');
+      t.title = 'ships inside the Bazel binary — nothing to install, and it works on any machine';
+      row.append(t);
+    }
     row.append(el('span', 'skill-desc', sk.description || ''));
 
     const acoes = el('span', 'skill-actions');

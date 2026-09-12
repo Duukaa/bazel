@@ -566,7 +566,7 @@ func TestStateListsAgentsAndReviewRejectsUnknown(t *testing.T) {
 		t.Errorf("a primeira escolha devia ser a padrão, veio %q", st.Agents[0].Name)
 	}
 	publisher := st.Agents[len(st.Agents)-1]
-	if !publisher.Publisher || publisher.Name != "post-report" {
+	if !publisher.Publisher || publisher.Name != "bazel-post-report" {
 		t.Errorf("o último devia ser o agente de publicação, marcado como tal: %+v", publisher)
 	}
 	pipeline := st.Agents[len(st.Agents)-2]

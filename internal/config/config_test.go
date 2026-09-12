@@ -27,7 +27,7 @@ func TestDefaultComecaSemAgentes(t *testing.T) {
 	}
 	// E o agente de publicação continua de pé: ele não é uma escolha da
 	// lista, é o que roda quando você manda publicar um review já lido.
-	if cfg.PostChoice().Name != "post-report" {
+	if cfg.PostChoice().Name != "bazel-post-report" {
 		t.Errorf("o post_agent devia continuar no padrão, veio %q", cfg.PostChoice().Name)
 	}
 }
@@ -345,7 +345,7 @@ func TestPostChoice(t *testing.T) {
 
 	// Config sem post_agent ganha o padrão.
 	fromDisk := loadFrom(t, "repos: [acme/api]\n")
-	if fromDisk.PostChoice().Name != "post-report" {
+	if fromDisk.PostChoice().Name != "bazel-post-report" {
 		t.Errorf("config sem post_agent devia cair no padrão, veio %q", fromDisk.PostChoice().Name)
 	}
 }
@@ -362,4 +362,59 @@ func loadFrom(t *testing.T, yaml string) *Config {
 		t.Fatalf("Load: %v", err)
 	}
 	return cfg
+}
+
+// A skill de publicação passou a viajar no binário. Quem está com o padrão
+// antigo intocado — que chamava a /post-report de ~/.claude/skills e só
+// funcionava em quem a tivesse instalado — ganha a embarcada; quem editou o
+// seu fica com o que escreveu.
+func TestPostAgentMigraParaAEmbarcada(t *testing.T) {
+	t.Run("padrão antigo vira o novo", func(t *testing.T) {
+		cfg := loadFrom(t, `repos: [acme/api-core]
+post_agent:
+  name: post-report
+  description: publishes the review you have just read, with inline comments
+  task: /post-report {{review_file}}
+  posts: true
+`)
+		if got := cfg.PostChoice().Name; got != "bazel-post-report" {
+			t.Errorf("o padrão antigo intocado devia migrar, veio %q", got)
+		}
+	})
+
+	t.Run("o que foi customizado sobrevive", func(t *testing.T) {
+		cfg := loadFrom(t, `repos: [acme/api-core]
+post_agent:
+  name: post-report
+  task: /post-report {{review_file}}
+  posts: true
+  timeout_seconds: 900
+  prompt: publique isso do meu jeito
+`)
+		post := cfg.PostChoice()
+		if post.Name != "bazel-post-report" {
+			t.Errorf("a skill devia migrar, veio %q", post.Name)
+		}
+		if post.Steps[0].Prompt != "publique isso do meu jeito" {
+			t.Errorf("o prompt escrito à mão devia sobreviver: %q", post.Steps[0].Prompt)
+		}
+		if post.Steps[0].TimeoutSeconds != 900 {
+			t.Errorf("o timeout escrito à mão devia sobreviver: %d", post.Steps[0].TimeoutSeconds)
+		}
+	})
+
+	t.Run("post_agent editado fica como está", func(t *testing.T) {
+		cfg := loadFrom(t, `repos: [acme/api-core]
+post_agent:
+  name: post-report
+  task: /post-report {{review_file}} --mine
+  posts: true
+`)
+		if got := cfg.PostChoice().Name; got != "post-report" {
+			t.Errorf("post_agent seu não se mexe, veio %q", got)
+		}
+		if !strings.Contains(cfg.PostChoice().Steps[0].Task, "--mine") {
+			t.Error("a task escrita à mão devia sobreviver")
+		}
+	})
 }

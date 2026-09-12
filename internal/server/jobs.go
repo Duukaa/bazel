@@ -349,6 +349,16 @@ func (m *Manager) run(job *Job) {
 		return
 	}
 
+	// Relatório colado num bloco ```markdown sai do bloco antes de qualquer
+	// outra coisa: dentro dele os headings são texto, e a tela, o disco e o PR
+	// mostrariam o markdown cru em vez do review.
+	//
+	// Passo a passo, e não só no corpo final, porque o corpo de cada passo é
+	// reaproveitado depois: ele volta no `joinSteps` quando uma pipeline parada
+	// continua, e é dele que sai o que vai ao PR quando só parte dos passos é
+	// publicável.
+	desembrulha(&res)
+
 	// Parou num `pause`: o clone fica, o worker sai, e o job espera você ler o
 	// que saiu e mandar continuar.
 	if res.StoppedAt >= 0 && job.Choice.Steps[res.StoppedAt].Reserved == config.StepPause {
@@ -363,9 +373,6 @@ func (m *Manager) run(job *Job) {
 		saveErr error
 	)
 	if job.publish == nil {
-		// Relatório colado num bloco ```markdown sai do bloco antes de ir
-		// à tela, ao disco e ao PR — dentro dele nada renderiza.
-		res.Body = store.Unwrap(res.Body)
 		path, saveErr = store.Save(m.reviewsDir, res)
 	}
 
@@ -417,6 +424,16 @@ func (m *Manager) run(job *Job) {
 			m.mu.Unlock()
 			m.publish(job)
 		}
+	}
+}
+
+// desembrulha tira o relatório de dentro de um bloco ```markdown — o corpo e o
+// de cada passo. O agente às vezes devolve o relatório inteiro colado num bloco
+// de código, e aí nada dele renderiza: a página mostra o markdown cru.
+func desembrulha(res *agent.Result) {
+	res.Body = store.Unwrap(res.Body)
+	for i := range res.Steps {
+		res.Steps[i].Body = store.Unwrap(res.Steps[i].Body)
 	}
 }
 

@@ -1374,3 +1374,60 @@ func TestPipelinePausadaPodeSerAbandonada(t *testing.T) {
 		t.Error("não dá para continuar o que foi abandonado")
 	}
 }
+
+// O agente às vezes devolve o relatório colado num bloco ```markdown. Dentro
+// dele nada renderiza — a tela mostra o markdown cru em vez do review — e por
+// isso o bloco sai antes de qualquer outra coisa: na pausa, no disco e no que
+// vai ao PR.
+func TestRelatorioSaiDoBlocoDeCodigo(t *testing.T) {
+	const relatorio = "```markdown\n# Review Fleet — PR #482\n\n**Verdict:** comment\n\n## Findings\n\n### Token stored client-side\n\nThe refresh token is written to localStorage.\n```"
+
+	cfg := cfgFor(t, "echo")
+	cfg.Agent.Prompt = "{{task}}"
+	cfg.Agent.Checkout = false
+	cfg.Agents = []config.AgentDef{
+		{Name: "frota", Command: "printf", Args: []string{"%s", relatorio}},
+		{Name: "depois", Command: "echo", Args: []string{"segundo passo"}},
+	}
+	cfg.Pipelines = []config.Pipeline{{Name: "com pausa", Steps: []string{"frota", "pause", "depois"}}}
+	choice, err := cfg.ChoiceByName("com pausa")
+	if err != nil {
+		t.Fatalf("ChoiceByName: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	hub := NewHub()
+	ch := hub.Subscribe()
+	defer hub.Unsubscribe(ch)
+
+	dir := t.TempDir()
+	m := NewManager(ctx, cfg, dir, 1, false, hub)
+	view, err := m.Enqueue(testPR(482), false, choice)
+	if err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Na pausa, o que você lê já é o review — não o markdown dele.
+	waitFor(t, ch, view.ID, StatePaused)
+	parado, _ := m.View(view.ID, true)
+	if strings.HasPrefix(strings.TrimSpace(parado.Body), "```") {
+		t.Errorf("o parcial da pausa ainda está embrulhado:\n%s", parado.Body)
+	}
+	if !strings.Contains(parado.HTML, "<h1>") {
+		t.Errorf("o parcial devia renderizar como review, veio:\n%.200s", parado.HTML)
+	}
+
+	// E continuar não pode trazer a cerca de volta pelo corpo do passo guardado.
+	if _, err := m.Continue(view.ID); err != nil {
+		t.Fatalf("Continue: %v", err)
+	}
+	waitFor(t, ch, view.ID, StateDone)
+	fim, _ := m.View(view.ID, true)
+	if strings.Contains(fim.Body, "```markdown") {
+		t.Errorf("a cerca voltou no relatório final:\n%s", fim.Body)
+	}
+	if !strings.Contains(fim.HTML, "<h1>") || !strings.Contains(fim.Body, "segundo passo") {
+		t.Errorf("o relatório final devia ter os dois passos, renderizados:\n%s", fim.Body)
+	}
+}

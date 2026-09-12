@@ -206,7 +206,8 @@ p.tiny { font-size: 12px; margin: -4px 0 8px; }
 .saved .name { font-size: 12px; color: var(--dim); }
 
 /* --- páginas --- */
-/* O dashboard e a configuração são irmãos no mesmo documento, e a navegação é
+/* --- as duas páginas ---
+   O dashboard e a configuração são irmãos no mesmo documento, e a navegação é
    por hash: trocar de página não recarrega nada, então o SSE continua aberto e
    um review em andamento não perde o log ao você ir ver a config. */
 .page[hidden] { display: none; }
@@ -222,6 +223,7 @@ p.tiny { font-size: 12px; margin: -4px 0 8px; }
 }
 .nav a:hover { color: var(--fg); }
 .nav a.on { color: var(--accent); border-color: var(--line); background: var(--panel-2); }
+
 /* O caminho do config é um caminho, não um rótulo: nada de caixa alta. */
 .config-body #config-path { text-transform: none; letter-spacing: 0; word-break: break-all; }
 .config-body pre { margin: 0; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 14px; overflow: auto; font-size: 12.5px; }
@@ -472,7 +474,6 @@ main.no-prs .burger span { background: var(--accent); }
 #config-raw pre { margin-top: 8px; }
 .state.paused { color: var(--warn); }
 .step.paused { color: var(--warn); }
-.pipe-sep { color: var(--dim); padding: 0 2px; }
 
 /* O aviso do molde que dispara comando sozinho. Fica no topo da configuração,
    que é onde se conserta. */

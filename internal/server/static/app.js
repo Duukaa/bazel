@@ -1435,6 +1435,7 @@ function wire() {
   // O arquivo inteiro, para levar a outra máquina. O servidor manda com
   // Content-Disposition, então um link basta — sem Blob, sem cópia na memória.
   $('#config-download').addEventListener('click', () => { window.location.href = '/api/config/file'; });
+
   document.addEventListener('keydown', (e) => {
     // Escape na configuração volta ao dashboard: é o que o modal fazia, e o
     // dedo de quem já usava o Bazel continua sabendo disso.

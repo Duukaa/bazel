@@ -473,3 +473,12 @@ main.no-prs .burger span { background: var(--accent); }
 .state.paused { color: var(--warn); }
 .step.paused { color: var(--warn); }
 .pipe-sep { color: var(--dim); padding: 0 2px; }
+
+/* O aviso do molde que dispara comando sozinho. Fica no topo da configuração,
+   que é onde se conserta. */
+.stray {
+  border: 1px solid var(--warn); border-radius: 8px; padding: 10px 12px;
+  margin-bottom: 20px; font-size: 12.5px; line-height: 1.6; color: var(--fg);
+}
+.stray[hidden] { display: none; }
+.stray code { background: var(--bg); border-radius: 4px; padding: 1px 5px; }

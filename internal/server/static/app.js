@@ -14,6 +14,7 @@ const state = {
   skills: [],         // skills instaladas na máquina
   pipeSteps: [],      // passos que o montador de pipeline está juntando
   pipeName: '',       // nome que o montador vai dar à pipeline
+  warning: '',        // aviso de configuração que vale a sessão inteira
   skillsDir: '',
   agent: '',          // nome do que roda no próximo review
   selected: new Set(),
@@ -116,11 +117,17 @@ async function boot() {
     applyAgents(st.agents || []);
     state.repos = st.repos || [];
     renderRepoFilter();
-    if (!state.repos.length) {
-      banner('No repositories watched — go to "config" and add one (owner/repo).');
+    // Um comando escrito no molde roda junto com todo agente que você escolher,
+    // e nada no resultado denuncia isso — só o gasto no fim.
+    if (st.stray_command) {
+      state.warning = `Your agent.prompt has no {{task}} and runs ${st.stray_command} on its own —`
+        + ` every agent you pick runs two commands, the one you chose and that one. Fix it in "config".`;
+    } else if (!state.repos.length) {
+      state.warning = 'No repositories watched — go to "config" and add one (owner/repo).';
     } else if (!selectableAgents().length) {
-      banner('No agents configured — go to "config" and build your list out of the installed skills.');
+      state.warning = 'No agents configured — go to "config" and build your list out of the installed skills.';
     }
+    banner(state.warning);
     renderJobs();
   } catch (err) {
     banner('Could not reach the server: ' + err.message);
@@ -140,9 +147,11 @@ async function loadPRs(force) {
     const data = await api('/api/prs' + (force ? '?refresh=1' : ''));
     state.prs = data.prs || [];
     state.repoErrors = data.repo_errors || [];
+    // Sem erro de repositório o banner volta ao aviso de configuração, se
+    // houver um: limpar aqui apagava justamente o que a partida tinha a dizer.
     banner(state.repoErrors.length
       ? state.repoErrors.map((e) => `⚠ ${e.repo}: ${e.error}`).join('\n')
-      : '');
+      : state.warning);
     // As contagens do filtro por repositório saem daqui, então ele é montado
     // antes da lista.
     renderRepoFilter();
@@ -1849,6 +1858,7 @@ async function refreshConfig() {
     const cfg = await api('/api/config');
     $('#config-path').textContent = cfg.path;
     $('#config-yaml').textContent = cfg.yaml;
+    renderStray(cfg.stray_command);
   } catch (err) {
     $('#config-yaml').textContent = err.message;
     $('#config-raw').open = true;
@@ -1858,6 +1868,22 @@ async function refreshConfig() {
   renderAgentList();
   renderPipelineBuilder();
   renderSkillList();
+}
+
+// renderStray avisa, na página onde se conserta, que o molde de `agent` dispara
+// um comando sozinho. É o erro que mais engana: o agente roda, o relatório sai,
+// e só a conta de tokens denuncia que dois comandos rodaram.
+function renderStray(cmd) {
+  const box = $('#stray');
+  box.hidden = !cmd;
+  if (!cmd) return;
+  box.innerHTML = '';
+  box.append(el('b', null, `agent.prompt runs ${cmd} on its own.`));
+  box.append(document.createTextNode(' It has no '));
+  box.append(el('code', null, '{{task}}'), document.createTextNode(', so Bazel prepends the agent'
+    + ` you picked and the template still fires ${cmd} below it — every run does both. Put `));
+  box.append(el('code', null, '{{task}}'));
+  box.append(document.createTextNode(` where ${cmd} is, in the file below.`));
 }
 
 function renderRepos() {

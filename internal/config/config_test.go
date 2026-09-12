@@ -763,3 +763,28 @@ func TestPassosReservados(t *testing.T) {
 		}
 	})
 }
+
+// Um molde de `agent` sem {{task}} ganha a task prefixada — e se ele já tiver
+// um comando escrito à mão, todo agente passa a rodar dois: o escolhido e o do
+// molde. O agente parece funcionar, e só a conta de tokens denuncia.
+func TestStrayCommand(t *testing.T) {
+	casos := []struct {
+		nome   string
+		prompt string
+		want   string
+	}{
+		{"molde de fábrica", defaultPrompt, ""},
+		{"molde antigo com a skill escrita", "/review-fleet {{number}}\n\nO repositório {{repo}}…", "/review-fleet"},
+		{"comando sem argumento", "/review-fleet\n\nrevise aí", "/review-fleet"},
+		{"molde seu, sem comando", "Revise o PR {{number}} do {{repo}}.", ""},
+		{"tem {{task}}, o comando é intencional", "{{task}}\n\nse precisar, /review-fleet {{number}}", ""},
+		{"caminho não é comando", "leia /etc/hosts e revise", ""},
+	}
+	for _, c := range casos {
+		cfg := Default()
+		cfg.Agent.Prompt = c.prompt
+		if got := cfg.StrayCommand(); got != c.want {
+			t.Errorf("%s: StrayCommand() = %q, queria %q", c.nome, got, c.want)
+		}
+	}
+}

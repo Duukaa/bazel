@@ -246,6 +246,7 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 	repos := append([]string(nil), s.cfg.Repos...)
 	authors := append([]string(nil), s.cfg.Authors...)
 	drafts := s.cfg.IncludeDrafts
+	stray := s.cfg.StrayCommand()
 	s.cfgMu.Unlock()
 
 	writeJSON(w, http.StatusOK, map[string]any{
@@ -266,6 +267,10 @@ func (s *Server) handleState(w http.ResponseWriter, r *http.Request) {
 		},
 		"agents": s.agentViews(),
 		"jobs":   s.jobViews(),
+		// Um molde de `agent` que dispara um comando por conta própria faz todo
+		// agente rodar dois: o escolhido e o do molde. A página avisa, porque
+		// nada no resultado denuncia isso — só o gasto.
+		"stray_command": stray,
 		// A cota do Claude vem vazia até o primeiro review desta sessão.
 		"limits": s.jobs.Limits(),
 	})
@@ -811,7 +816,12 @@ func (s *Server) handleConfig(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, fmt.Errorf("could not read %s", s.configPath))
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"path": s.configPath, "yaml": string(data)})
+	s.cfgMu.Lock()
+	stray := s.cfg.StrayCommand()
+	s.cfgMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{
+		"path": s.configPath, "yaml": string(data), "stray_command": stray,
+	})
 }
 
 func (s *Server) handleSavedList(w http.ResponseWriter, r *http.Request) {

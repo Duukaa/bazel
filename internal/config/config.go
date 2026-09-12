@@ -755,6 +755,40 @@ func sameArgs(a, b []string) bool {
 	return true
 }
 
+// StrayCommand devolve o comando que o molde de `agent` dispara por conta
+// própria. É o vazio no caso normal.
+//
+// Um molde sem `{{task}}` ganha a task prefixada na primeira linha, o que é
+// conveniente para quem escreveu um molde sem placeholder — e é uma armadilha
+// para quem escreveu um molde de antes de existir seletor, com a skill escrita
+// à mão nele. Aí todo agente roda dois comandos: o que você escolheu e o que
+// está no molde. O agente até parece funcionar, e o segundo comando aparece
+// como um gasto que ninguém pediu.
+//
+// Agente com `prompt` próprio não passa por aqui: só herda quem não escreveu o
+// seu, e é o bloco `agent` que vale para esses.
+func (c *Config) StrayCommand() string {
+	tmpl := c.Agent.Prompt
+	if strings.Contains(tmpl, "{{task}}") {
+		return ""
+	}
+	for _, line := range strings.Split(tmpl, "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, "/") {
+			continue
+		}
+		cmd := line
+		if i := strings.IndexAny(cmd, " \t"); i > 0 {
+			cmd = cmd[:i]
+		}
+		// Um caminho absoluto não é comando; uma skill não tem barra no meio.
+		if len(cmd) > 1 && !strings.Contains(cmd[1:], "/") {
+			return cmd
+		}
+	}
+	return ""
+}
+
 // promptNeedsTask diz se o molde é o de fábrica — uma casca em volta do
 // {{task}} de um agente. Sozinho ele não pede nada: quem manda no review é o
 // agente que preenche esse buraco.

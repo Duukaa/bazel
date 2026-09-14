@@ -92,7 +92,7 @@ func TestAddAgentFromSkill(t *testing.T) {
 	if !strings.Contains(post.Task, "--post") {
 		t.Errorf("a task devia levar o --post: %q", post.Task)
 	}
-	if strings.Contains(post.Prompt, "não publique nada no GitHub") {
+	if strings.Contains(post.Prompt, "do not publish anything to GitHub") {
 		t.Error("o molde de quem publica não pode proibir publicar")
 	}
 
@@ -168,6 +168,73 @@ func TestResolveInheritsBase(t *testing.T) {
 	}
 	if got[0].NeedsCheckout() != true || got[1].NeedsCheckout() != false {
 		t.Error("NeedsCheckout não seguiu o checkout de cada passo")
+	}
+}
+
+func TestResolveKeepsAgentEnv(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.Env = map[string]string{"FROM_BASE": "1"}
+	cfg.Agents = []AgentDef{
+		{Name: "herda"},
+		{
+			Name:    "grok-review",
+			Command: "grok",
+			Env:     map[string]string{"GROK_MCP_STARTUP_TIMEOUT_SECS": "2"},
+		},
+	}
+	cfg.Pipelines = nil
+
+	choices := cfg.Choices()
+	if choices[0].Steps[0].Env["FROM_BASE"] != "1" {
+		t.Errorf("did not inherit base env: %v", choices[0].Steps[0].Env)
+	}
+	got := choices[1].Steps[0]
+	if got.Env["GROK_MCP_STARTUP_TIMEOUT_SECS"] != "2" {
+		t.Errorf("own env was dropped: %v", got.Env)
+	}
+	if _, ok := got.Env["FROM_BASE"]; ok {
+		t.Errorf("own env should replace the base map, not merge: %v", got.Env)
+	}
+}
+
+func TestResolveFormatInheritanceAndOverride(t *testing.T) {
+	cfg := Default()
+	if cfg.Agent.Format != "" {
+		t.Fatalf("default agent format must stay empty, got %q", cfg.Agent.Format)
+	}
+	cfg.Agent.Format = "claude-stream"
+	cfg.Agents = []AgentDef{
+		{Name: "inherits"},
+		{Name: "overrides", Format: "codex-json"},
+		{Name: "command-only", Command: "codex"},
+	}
+
+	choices := cfg.Choices()
+	if got := choices[0].Steps[0].Format; got != "claude-stream" {
+		t.Errorf("inherited format = %q, want claude-stream", got)
+	}
+	if got := choices[1].Steps[0].Format; got != "codex-json" {
+		t.Errorf("override format = %q, want codex-json", got)
+	}
+	if got := choices[2].Steps[0].Format; got != "claude-stream" {
+		t.Errorf("command-only override format = %q, want claude-stream", got)
+	}
+
+	cfg.Agent.Format = ""
+	if got := cfg.Choices()[2].Steps[0].Format; got != "" {
+		t.Errorf("command-only override without a configured format = %q, want empty", got)
+	}
+}
+
+func TestPostChoiceInheritsAndOverridesFormat(t *testing.T) {
+	cfg := Default()
+	cfg.Agent.Format = "claude-stream"
+	if got := cfg.PostChoice().Steps[0].Format; got != "claude-stream" {
+		t.Errorf("post agent inherited format = %q, want claude-stream", got)
+	}
+	cfg.PostAgent.Format = "plain"
+	if got := cfg.PostChoice().Steps[0].Format; got != "plain" {
+		t.Errorf("post agent override format = %q, want plain", got)
 	}
 }
 
@@ -274,7 +341,7 @@ func TestPostingAgentIsMarked(t *testing.T) {
 	if !strings.Contains(post.Steps[0].Task, "--post") {
 		t.Errorf("a task devia disparar a frota com --post: %q", post.Steps[0].Task)
 	}
-	if strings.Contains(post.Steps[0].Prompt, "não publique nada no GitHub") {
+	if strings.Contains(post.Steps[0].Prompt, "do not publish anything to GitHub") {
 		t.Error("o molde dele não pode proibir publicar")
 	}
 
@@ -282,7 +349,7 @@ func TestPostingAgentIsMarked(t *testing.T) {
 	if plain.Posts {
 		t.Error("a frota normal não publica sozinha")
 	}
-	if !strings.Contains(plain.Steps[0].Prompt, "não publique nada no GitHub") {
+	if !strings.Contains(plain.Steps[0].Prompt, "do not publish anything to GitHub") {
 		t.Error("o molde padrão devia continuar proibindo publicar")
 	}
 }
@@ -318,6 +385,59 @@ func TestLoadUpgradesLegacyArgs(t *testing.T) {
 	}
 }
 
+func TestFormatOmissionAndRoundTrip(t *testing.T) {
+	cfg := loadFrom(t, "repos: [acme/api]\nagent:\n  command: codex\nagents:\n  - name: custom\n    command: gemini\n")
+	if cfg.Agent.Format != "" || cfg.Agents[0].Format != "" {
+		t.Fatalf("omitted formats must remain empty: %+v / %+v", cfg.Agent, cfg.Agents[0])
+	}
+	if got := cfg.Choices()[0].Steps[0].Format; got != "" {
+		t.Errorf("command-only config inferred format %q", got)
+	}
+
+	cfg.Agent.Format = "claude-stream"
+	cfg.Agents[0].Format = "codex-json"
+	if err := cfg.Save(); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	reloaded, err := Load()
+	if err != nil {
+		t.Fatalf("Load after Save: %v", err)
+	}
+	if reloaded.Agent.Format != "claude-stream" || reloaded.Agents[0].Format != "codex-json" {
+		t.Errorf("formats did not round trip: %+v / %+v", reloaded.Agent, reloaded.Agents[0])
+	}
+}
+
+func TestFormatValidationOnLoadAndSave(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{"base", "agent:\n  format: nope\n", "base agent"},
+		{"agent", "agents:\n  - name: custom\n    format: nope\n", "agents[0]"},
+		{"post", "post_agent:\n  name: publish\n  format: nope\n", "post_agent"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			t.Setenv("BAZEL_HOME", dir)
+			if err := os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(tc.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load()
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("Load error = %v, want context %q", err, tc.want)
+			}
+		})
+	}
+
+	cfg := Default()
+	cfg.PostAgent.Format = "nope"
+	if err := cfg.Save(); err == nil || !strings.Contains(err.Error(), "post_agent") {
+		t.Errorf("Save error = %v, want post_agent context", err)
+	}
+}
+
 // O agente de publicação é o que roda depois de você ler o review: clona por
 // padrão (inline precisa do diff) e leva o arquivo do review no prompt.
 func TestPostChoice(t *testing.T) {
@@ -332,7 +452,7 @@ func TestPostChoice(t *testing.T) {
 	if !strings.Contains(post.Steps[0].Task, "{{review_file}}") {
 		t.Errorf("a task devia receber o arquivo do review: %q", post.Steps[0].Task)
 	}
-	if !strings.Contains(post.Steps[0].Prompt, "Não refaça o review") {
+	if !strings.Contains(post.Steps[0].Prompt, "Do not redo the review") {
 		t.Error("o molde precisa proibir refazer o review — o que vai ao PR é o que foi lido")
 	}
 

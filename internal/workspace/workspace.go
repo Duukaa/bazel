@@ -43,7 +43,54 @@ func Prepare(ctx context.Context, pr gh.PR) (*Workspace, error) {
 		ws.Remove()
 		return nil, fmt.Errorf("checkout de %s: %w", pr.Key(), err)
 	}
+	// gh repo clone só traz os refs remotos que o clone inicial configurou —
+	// geralmente a branch padrão. Um PR para uma release branch precisa da base
+	// explícita para que o agente consiga comparar origin/<base>...HEAD.
+	if base := strings.TrimSpace(pr.BaseRefName); base != "" {
+		if err := ensurePRBase(ctx, dir, base); err != nil {
+			ws.Remove()
+			return nil, fmt.Errorf("base %s de %s: %w", base, pr.Key(), err)
+		}
+	}
 	return ws, nil
+}
+
+// ensurePRBase makes origin/<base> and a local <base> branch available when
+// possible. A failed fetch is not fatal if the tracking ref is already there;
+// git branch --force is skipped when <base> is already HEAD.
+func ensurePRBase(ctx context.Context, dir, base string) error {
+	refspec := "+refs/heads/" + base + ":refs/remotes/origin/" + base
+	if err := run(ctx, dir, "git", "fetch", "origin", refspec); err != nil {
+		if verify := run(ctx, dir, "git", "rev-parse", "--verify", "--quiet", "origin/"+base); verify != nil {
+			return fmt.Errorf("buscando: %w", err)
+		}
+	}
+	head, err := gitOutput(ctx, dir, "rev-parse", "--abbrev-ref", "HEAD")
+	if err != nil {
+		return err
+	}
+	if head == base {
+		return nil
+	}
+	if err := run(ctx, dir, "git", "branch", "--force", base, "origin/"+base); err != nil {
+		return fmt.Errorf("criando branch local: %w", err)
+	}
+	return nil
+}
+
+func gitOutput(ctx context.Context, dir string, args ...string) (string, error) {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.Dir = dir
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout
+	cmd.Stderr = &stderr
+	if err := cmd.Run(); err != nil {
+		if msg := strings.TrimSpace(stderr.String()); msg != "" {
+			return "", fmt.Errorf("%s", lastLines(msg, 3))
+		}
+		return "", err
+	}
+	return strings.TrimSpace(stdout.String()), nil
 }
 
 // Cleanup apaga o clone, a menos que Keep esteja ligado.

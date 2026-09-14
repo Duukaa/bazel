@@ -59,6 +59,9 @@ type AgentDef struct {
 	// rodar uma lente em outro modelo ou em outro executável.
 	Command string   `yaml:"command,omitempty"`
 	Args    []string `yaml:"args,omitempty"`
+	// Format descreve o protocolo de saída do agente. Vazio preserva a
+	// detecção legada pelos args (Claude stream-json, ou saída crua).
+	Format string `yaml:"format,omitempty"`
 	// Posts marca o agente que publica o review no PR sozinho, em vez de
 	// devolver o texto para o Bazel publicar depois. A interface avisa antes
 	// de rodar um desses: é escrita em PR de outra pessoa.
@@ -73,6 +76,9 @@ type AgentDef struct {
 	Checkout *bool `yaml:"checkout,omitempty"`
 	// TimeoutSeconds sobrescreve agent.timeout_seconds. 0 = herda.
 	TimeoutSeconds int `yaml:"timeout_seconds,omitempty"`
+	// Env is merged into this agent's process environment. Empty inherits
+	// agent.env; that empty too means the Bazel process environment only.
+	Env map[string]string `yaml:"env,omitempty"`
 }
 
 // Pipeline é uma sequência de agentes rodada sobre o mesmo clone do PR.
@@ -112,12 +118,14 @@ type ResolvedAgent struct {
 	Description    string
 	Command        string
 	Args           []string
+	Format         string
 	Prompt         string
 	Task           string
 	Posts          bool
 	Publishable    bool
 	Checkout       bool
 	TimeoutSeconds int
+	Env            map[string]string
 	// Reserved é o nome do passo reservado quando este não é um agente de
 	// verdade — `pause` ou `publish`. Vazio no resto.
 	Reserved string
@@ -145,6 +153,9 @@ type Agent struct {
 	Command string `yaml:"command"`
 	// Args são os argumentos fixos. O prompt vai pelo stdin.
 	Args []string `yaml:"args"`
+	// Format identifica o protocolo de saída estruturada do agente. Vazio
+	// preserva a detecção legada pelos args.
+	Format string `yaml:"format,omitempty"`
 	// Checkout clona o repositório numa pasta temporária e faz o checkout do
 	// PR antes de rodar o agente, que roda com essa pasta como diretório de
 	// trabalho. Necessário para agentes que leem o código, e não só o diff.
@@ -155,69 +166,68 @@ type Agent struct {
 	Prompt string `yaml:"prompt"`
 	// TimeoutSeconds limita a duração de um review. 0 = sem limite.
 	TimeoutSeconds int `yaml:"timeout_seconds"`
+	// Env is merged into every agent process that does not set its own env.
+	Env map[string]string `yaml:"env,omitempty"`
 }
 
 const defaultPrompt = `{{task}}
 
-O repositório {{repo}} está clonado nesta pasta ({{workdir}}), com o PR
-#{{number}} já em checkout na branch ` + "`{{branch}}`" + ` sobre a base ` + "`{{base}}`" + `.
-É um clone temporário e descartável: leia à vontade, mas não edite arquivos,
-não commite e não publique nada no GitHub.
+The repository {{repo}} is cloned in this directory ({{workdir}}), with PR
+#{{number}} already checked out on branch ` + "`{{branch}}`" + ` over base ` + "`{{base}}`" + `.
+This is a throwaway clone: read freely, but do not edit files, do not commit,
+and do not publish anything to GitHub.
 
 PR: {{title}} — @{{author}}
 {{url}}
 
-Descrição do PR:
+PR description:
 {{body}}
 
-Devolva no stdout só o relatório final, em markdown.`
+Write only the final report to stdout, in Markdown.`
 
 // postPrompt é o molde do agente que publica sozinho. O molde padrão proíbe
 // escrever no GitHub — este troca essa linha pela permissão explícita, que é
 // justamente o que a skill de post precisa.
 const postPrompt = `{{task}}
 
-O repositório {{repo}} está clonado nesta pasta ({{workdir}}), com o PR
-#{{number}} já em checkout na branch ` + "`{{branch}}`" + ` sobre a base ` + "`{{base}}`" + `.
-É um clone temporário e descartável: leia à vontade, mas não edite arquivos e
-não commite nada.
+The repository {{repo}} is cloned in this directory ({{workdir}}), with PR
+#{{number}} already checked out on branch ` + "`{{branch}}`" + ` over base ` + "`{{base}}`" + `.
+This is a throwaway clone: read freely, but do not edit files and do not commit.
 
-Você **tem** autorização para publicar o resultado no PR #{{number}} de
-{{repo}} — é para isso que este review foi disparado. Publique um review só,
-com os comentários inline nas linhas certas, e não abra outro se já houver um
-seu no PR.
+You **are** authorized to publish the result on PR #{{number}} of
+{{repo}} — that is why this review was started. Publish a single review,
+with inline comments on the right lines, and do not open another if you
+already have one on the PR.
 
 PR: {{title}} — @{{author}}
 {{url}}
 
-Descrição do PR:
+PR description:
 {{body}}
 
-Devolva no stdout o relatório final em markdown, dizendo no fim o que foi
-publicado no PR.`
+Write the final report to stdout in Markdown, and say at the end what was
+published on the PR.`
 
 // publishPrompt é o molde de quem publica um review já escrito. A instrução
 // que importa é a última: não refazer o review, publicar o que está no arquivo
 // — é ele que você leu na tela antes de mandar.
 const publishPrompt = `{{task}}
 
-O repositório {{repo}} está clonado nesta pasta ({{workdir}}), com o PR
-#{{number}} já em checkout na branch ` + "`{{branch}}`" + ` sobre a base ` + "`{{base}}`" + `.
-É um clone temporário e descartável: leia à vontade, mas não edite arquivos e
-não commite nada.
+The repository {{repo}} is cloned in this directory ({{workdir}}), with PR
+#{{number}} already checked out on branch ` + "`{{branch}}`" + ` over base ` + "`{{base}}`" + `.
+This is a throwaway clone: read freely, but do not edit files and do not commit.
 
-O review já está pronto e já foi lido — está em {{review_file}}. Publique-o no
-PR #{{number}} de {{repo}}: um review só, com os comentários inline nas linhas
-certas, e não abra outro se já houver um seu no PR.
+The review is already done and has been read — it is in {{review_file}}. Publish
+it on PR #{{number}} of {{repo}}: a single review, with inline comments on the
+right lines, and do not open another if you already have one on the PR.
 
-**Não refaça o review e não invente achado novo**: publique o que está no
-arquivo. Se algum achado não couber numa linha do diff, deixe-o no corpo do
-review.
+**Do not redo the review and do not invent new findings**: publish what is in
+the file. If a finding does not fit on a diff line, leave it in the review body.
 
 PR: {{title}} — @{{author}}
 {{url}}
 
-Devolva no stdout o que foi publicado, em markdown.`
+Write to stdout what was published, in Markdown.`
 
 // defaultArgs são os args do `claude`. O --output-format stream-json é o que
 // faz o agente narrar o que está fazendo enquanto trabalha, em vez de ficar
@@ -368,6 +378,9 @@ func Load() (*Config, error) {
 	if cfg.MaxDiffBytes <= 0 {
 		cfg.MaxDiffBytes = Default().MaxDiffBytes
 	}
+	if err := cfg.validateFormats(); err != nil {
+		return nil, err
+	}
 	return cfg, nil
 }
 
@@ -395,6 +408,9 @@ func LoadOrInit() (*Config, bool, error) {
 
 // Save grava a configuração, criando o diretório se necessário.
 func (c *Config) Save() error {
+	if err := c.validateFormats(); err != nil {
+		return err
+	}
 	path, err := Path()
 	if err != nil {
 		return err
@@ -789,6 +805,33 @@ func (c *Config) StrayCommand() string {
 	return ""
 }
 
+// validateFormats rejects only explicit, unsupported output protocols. An
+// empty format deliberately remains valid: existing configurations retain
+// their argument-based Claude stream detection or raw stdout behavior.
+func (c *Config) validateFormats() error {
+	if err := validateFormat(c.Agent.Format); err != nil {
+		return fmt.Errorf("invalid format for base agent: %w", err)
+	}
+	for i, def := range c.Agents {
+		if err := validateFormat(def.Format); err != nil {
+			return fmt.Errorf("invalid format for agents[%d]: %w", i, err)
+		}
+	}
+	if err := validateFormat(c.PostAgent.Format); err != nil {
+		return fmt.Errorf("invalid format for post_agent: %w", err)
+	}
+	return nil
+}
+
+func validateFormat(format string) error {
+	switch format {
+	case "", "claude-stream", "codex-json", "grok-stream", "plain":
+		return nil
+	default:
+		return fmt.Errorf("%q (expected claude-stream, codex-json, grok-stream, or plain)", format)
+	}
+}
+
 // promptNeedsTask diz se o molde é o de fábrica — uma casca em volta do
 // {{task}} de um agente. Sozinho ele não pede nada: quem manda no review é o
 // agente que preenche esse buraco.
@@ -994,10 +1037,12 @@ func (c *Config) baseChoice() Choice {
 		Description:    "the agent configured under `agent`",
 		Command:        c.Agent.Command,
 		Args:           c.Agent.Args,
+		Format:         c.Agent.Format,
 		Prompt:         c.Agent.Prompt,
 		Publishable:    true,
 		Checkout:       c.Agent.Checkout,
 		TimeoutSeconds: c.Agent.TimeoutSeconds,
+		Env:            c.Agent.Env,
 	}
 	return Choice{Name: ra.Name, Description: ra.Description, Publishable: true, Steps: []ResolvedAgent{ra}}
 }
@@ -1009,6 +1054,7 @@ func (c *Config) resolve(def AgentDef) ResolvedAgent {
 		Description: def.Description,
 		Command:     def.Command,
 		Args:        def.Args,
+		Format:      def.Format,
 		Prompt:      def.Prompt,
 		Task:        def.Task,
 		Posts:       def.Posts,
@@ -1017,6 +1063,7 @@ func (c *Config) resolve(def AgentDef) ResolvedAgent {
 		Publishable:    def.Publishable == nil || *def.Publishable,
 		Checkout:       c.Agent.Checkout,
 		TimeoutSeconds: def.TimeoutSeconds,
+		Env:            def.Env,
 	}
 	if ra.Command == "" {
 		ra.Command = c.Agent.Command
@@ -1026,6 +1073,9 @@ func (c *Config) resolve(def AgentDef) ResolvedAgent {
 			ra.Args = c.Agent.Args
 		}
 	}
+	if ra.Format == "" {
+		ra.Format = c.Agent.Format
+	}
 	if strings.TrimSpace(ra.Prompt) == "" {
 		ra.Prompt = c.Agent.Prompt
 	}
@@ -1034,6 +1084,9 @@ func (c *Config) resolve(def AgentDef) ResolvedAgent {
 	}
 	if ra.TimeoutSeconds <= 0 {
 		ra.TimeoutSeconds = c.Agent.TimeoutSeconds
+	}
+	if len(ra.Env) == 0 {
+		ra.Env = c.Agent.Env
 	}
 	return ra
 }

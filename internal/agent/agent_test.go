@@ -153,6 +153,30 @@ func TestReviewRunsEveryStep(t *testing.T) {
 	}
 }
 
+func TestReviewPassesAgentEnv(t *testing.T) {
+	cfg := config.Default()
+	cfg.Agent.Checkout = false
+	cfg.Agent.Prompt = "{{task}}"
+	cfg.Agent.TimeoutSeconds = 30
+	cfg.Agents = []config.AgentDef{{
+		Name:    "env-check",
+		Command: "sh",
+		Args:    []string{"-c", `printf '%s' "$BAZEL_AGENT_ENV"`},
+		Env:     map[string]string{"BAZEL_AGENT_ENV": "from-agent"},
+	}}
+	choice, err := cfg.ChoiceByName("env-check")
+	if err != nil {
+		t.Fatalf("ChoiceByName: %v", err)
+	}
+	res, err := New(cfg).Review(context.Background(), testPR(), choice, nil)
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if res.Body != "from-agent" {
+		t.Errorf("agent env not visible in process: %q", res.Body)
+	}
+}
+
 // O log sai enquanto o agente roda, não só no fim — é o que a interface web
 // mostra ao vivo.
 func TestLogStreamsWhileAgentRuns(t *testing.T) {
@@ -383,6 +407,199 @@ func TestIsStreamJSON(t *testing.T) {
 				t.Errorf("isStreamJSON(%v) = %v", args, got)
 			}
 		}
+	}
+}
+
+func TestCodexJSONBecomesLogReportAndUsage(t *testing.T) {
+	var p codexAdapter
+	events := []string{
+		`{"type":"thread.started","thread_id":"t"}`,
+		`{"type":"turn.started"}`,
+		`{"type":"item.started","item":{"id":"cmd","type":"command_execution","command":"rg TODO"}}`,
+		`{"type":"item.completed","item":{"id":"cmd","type":"command_execution","status":"completed"}}`,
+		`{"type":"item.completed","item":{"id":"reason","type":"reasoning","text":"private"}}`,
+		`{"type":"item.completed","item":{"id":"message","type":"agent_message","text":"# Review\n\nFound one bug."}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":100,"cached_input_tokens":60,"output_tokens":20,"reasoning_output_tokens":12}}`,
+	}
+	var logs []string
+	for _, event := range events {
+		for _, line := range p.line(event) {
+			logs = append(logs, line.Text)
+		}
+	}
+	if got := p.report(); got != "# Review\n\nFound one bug." {
+		t.Errorf("report = %q", got)
+	}
+	if got := p.usage(); got != (Usage{InputTokens: 40, CacheRead: 60, OutputTokens: 20}) {
+		t.Errorf("usage = %+v", got)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, want := range []string{"· session started", "→ rg TODO", "✓ done · 120 tokens"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("log missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "private") {
+		t.Errorf("reasoning leaked into log: %s", joined)
+	}
+}
+
+func TestCodexJSONIgnoresMalformedEventsAndFailsTerminalTurn(t *testing.T) {
+	var p codexAdapter
+	if got := p.line("not json"); len(got) != 1 || got[0].Text != "not json" {
+		t.Errorf("malformed JSON should remain visible: %v", got)
+	}
+	p.line(`{"type":"turn.failed","message":"rate limit exceeded"}`)
+	if err := p.err(); err == nil || !strings.Contains(err.Error(), "rate limit exceeded") {
+		t.Errorf("terminal error = %v", err)
+	}
+}
+
+func TestCodexJSONShowsFailedCommandReason(t *testing.T) {
+	var p codexAdapter
+	got := p.line(`{"type":"item.completed","item":{"type":"command_execution","status":"failed","aggregated_output":"fatal: invalid upstream\nmore detail"}}`)
+	if len(got) != 1 || got[0].Text != "  ✗ command failed: fatal: invalid upstream" {
+		t.Errorf("failed command log = %v", got)
+	}
+}
+
+func TestCodexJSONRunsThroughRunner(t *testing.T) {
+	events := []string{
+		`{"type":"item.started","item":{"type":"command_execution","command":"git diff"}}`,
+		`{"type":"item.completed","item":{"id":"final","type":"agent_message","text":"# Verdict\n\nLooks good."}}`,
+		`{"type":"turn.completed","usage":{"input_tokens":10,"cached_input_tokens":4,"output_tokens":3}}`,
+	}
+	cfg := config.Default()
+	cfg.Agent.Checkout = false
+	cfg.Agent.Prompt = "{{task}}"
+	cfg.Agents = []config.AgentDef{{
+		Name:    "codex",
+		Command: "sh",
+		Args:    []string{"-c", "cat <<'EOF'\n" + strings.Join(events, "\n") + "\nEOF", "sh"},
+		Format:  "codex-json",
+	}}
+	choice, _ := cfg.ChoiceByName("codex")
+	var logs []string
+	res, err := New(cfg).Review(context.Background(), testPR(), choice, func(e Event) {
+		if e.Kind == EventLog {
+			logs = append(logs, e.Text)
+		}
+	})
+	if err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+	if res.Body != "# Verdict\n\nLooks good." {
+		t.Errorf("report = %q", res.Body)
+	}
+	if res.Usage.Total() != 13 {
+		t.Errorf("usage = %+v", res.Usage)
+	}
+	if got := strings.Join(logs, "\n"); !strings.Contains(got, "→ git diff") {
+		t.Errorf("Codex progress not forwarded: %s", got)
+	}
+}
+
+func TestOutputAdapterKeepsLegacyFormatDetection(t *testing.T) {
+	legacy, err := newOutputAdapter("", []string{"-p", "--output-format", "stream-json"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := legacy.(*claudeAdapter); !ok {
+		t.Fatalf("legacy adapter = %T, want claude", legacy)
+	}
+	plain, err := newOutputAdapter("", []string{"exec", "--json", "-"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := plain.(*plainAdapter); !ok {
+		t.Fatalf("unconfigured Codex adapter = %T, want plain", plain)
+	}
+	if _, err := newOutputAdapter("unknown", nil); err == nil {
+		t.Error("unknown explicit format should fail")
+	}
+}
+
+func TestGrokStreamBecomesLogReportAndUsage(t *testing.T) {
+	var p grokAdapter
+	events := []string{
+		`{"type":"available_commands","tools":["read_file"]}`,
+		`{"type":"thought","data":"private"}`,
+		`{"type":"text","data":"# Review\n"}`,
+		`{"type":"text","data":"Looks good."}`,
+		`{"type":"usage","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40,"reasoning_tokens":10}}`,
+		`{"type":"tool_call","title":"run_terminal_command","rawInput":{"command":"git diff","description":"inspect diff"}}`,
+		`{"type":"tool_call_update","status":"completed","rawOutput":{"exit_code":0,"command":"git diff","output_for_prompt":"ok"}}`,
+		`{"type":"end","stopReason":"end_turn","usage":{"input_tokens":100,"output_tokens":20,"cache_read_input_tokens":30,"cache_creation_input_tokens":40,"reasoning_tokens":10,"total_tokens":190},"total_cost_usd":0.02}`,
+	}
+	var logs []string
+	for _, event := range events {
+		for _, line := range p.line(event) {
+			logs = append(logs, line.Text)
+		}
+	}
+	if got := p.report(); got != "# Review\nLooks good." {
+		t.Errorf("report = %q", got)
+	}
+	if got := p.usage(); got != (Usage{InputTokens: 100, OutputTokens: 20, CacheRead: 30, CacheWrite: 40, CostUSD: 0.02}) {
+		t.Errorf("usage = %+v", got)
+	}
+	joined := strings.Join(logs, "\n")
+	for _, want := range []string{"→ git diff", "✓ command finished", "✓ done · 190 tokens · $0.02"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("log missing %q:\n%s", want, joined)
+		}
+	}
+	if strings.Contains(joined, "private") {
+		t.Errorf("thought leaked into log: %s", joined)
+	}
+}
+
+func TestGrokStreamShowsFailedCommandReason(t *testing.T) {
+	var p grokAdapter
+	got := p.line(`{"type":"tool_call_update","status":"completed","rawOutput":{"exit_code":1,"output_for_prompt":"fatal: bad revision\nmore"}}`)
+	if len(got) != 1 || got[0].Text != "  ✗ command failed: fatal: bad revision" {
+		t.Errorf("failed command log = %v", got)
+	}
+}
+
+func TestGrokStreamTreatsGrepNoMatchesAsProgress(t *testing.T) {
+	var p grokAdapter
+	p.line(`{"type":"tool_call","toolCallId":"grep-1","toolName":"grep","title":"Grep","rawInput":{"command":"StatusMetricsProvider"}}`)
+	got := p.line(`{"type":"tool_call_update","toolCallId":"grep-1","status":"completed","rawOutput":{"exit_code":1,"output_for_prompt":"exit: 1"}}`)
+	if len(got) != 1 || got[0].Text != "  · grep: no matches" {
+		t.Errorf("grep no-match log = %v", got)
+	}
+}
+
+func TestGrokStreamErrorEventSetsTerminal(t *testing.T) {
+	var p grokAdapter
+	got := p.line(`{"type":"error","message":"max turns reached"}`)
+	if len(got) != 1 || got[0].Text != "✗ max turns reached" {
+		t.Errorf("error log = %v", got)
+	}
+	if p.err() == nil || p.err().Error() != "max turns reached" {
+		t.Errorf("terminal error = %v", p.err())
+	}
+}
+
+func TestGrokStreamAccumulatesLiveUsage(t *testing.T) {
+	var p grokAdapter
+	p.line(`{"type":"usage","usage":{"input_tokens":10,"output_tokens":2}}`)
+	p.line(`{"type":"usage","usage":{"input_tokens":11,"output_tokens":3}}`)
+	if got := p.usage(); got != (Usage{InputTokens: 21, OutputTokens: 5}) {
+		t.Errorf("accumulated live usage = %+v", got)
+	}
+}
+
+func TestGrokTurnLimitHasOneClearError(t *testing.T) {
+	var p grokAdapter
+	if got := p.line(`{"type":"end","stopReason":"cancelled"}`); got != nil || p.err() != nil {
+		t.Errorf("turn-limit end should not produce a second error: logs=%v err=%v", got, p.err())
+	}
+
+	step := config.ResolvedAgent{Command: "grok", Format: "grok-stream"}
+	if got := agentFailure(step, "Error: max turns reached").Error(); got != "Grok reached its configured turn limit before completing the review" {
+		t.Errorf("turn-limit error = %q", got)
 	}
 }
 

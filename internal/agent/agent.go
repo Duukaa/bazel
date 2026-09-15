@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -451,10 +452,27 @@ func (r *Runner) exec(ctx context.Context, step config.ResolvedAgent, prompt, wo
 	if _, err := exec.LookPath(step.Command); err != nil {
 		return "", Usage{}, fmt.Errorf("agent `%s` not found in PATH", step.Command)
 	}
+	adapter, err := newOutputAdapter(step.Format, step.Args)
+	if err != nil {
+		return "", Usage{}, err
+	}
+	createdHome, err := isolateGrok(&step)
+	if err != nil {
+		return "", Usage{}, err
+	}
+	if createdHome != "" {
+		defer os.RemoveAll(createdHome)
+	}
 
 	cmd := exec.CommandContext(ctx, step.Command, step.Args...)
 	cmd.Dir = workdir // vazio = herda o diretório atual
 	cmd.Stdin = strings.NewReader(prompt)
+	if len(step.Env) > 0 {
+		cmd.Env = os.Environ()
+		for k, v := range step.Env {
+			cmd.Env = append(cmd.Env, k+"="+v)
+		}
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return "", Usage{}, err
@@ -472,11 +490,7 @@ func (r *Runner) exec(ctx context.Context, step config.ResolvedAgent, prompt, wo
 			onLog(stream, who, text)
 		}
 	}
-
 	var (
-		raw    strings.Builder
-		parser streamParser
-		stream = isStreamJSON(step.Args)
 		wg     sync.WaitGroup
 		errBuf lastLines
 	)
@@ -487,24 +501,18 @@ func (r *Runner) exec(ctx context.Context, step config.ResolvedAgent, prompt, wo
 		visto := 0
 		var cota time.Time
 		eachLine(stdout, func(line string) {
-			if !stream {
-				raw.WriteString(line)
-				raw.WriteByte('\n')
-				log("stdout", "", line)
-				return
-			}
-			for _, out := range parser.line(line) {
+			for _, out := range adapter.line(line) {
 				log("stdout", out.Agent, out.Text)
 			}
 			// A conta só sobe quando muda: uma chamada de ferramenta não
 			// gasta token nenhum e não precisa acordar o navegador.
-			if gasto := parser.spend(); onUsage != nil && gasto.Total() != visto {
+			if gasto := adapter.usage(); onUsage != nil && gasto.Total() != visto {
 				visto = gasto.Total()
 				onUsage(gasto)
 			}
-			if onLimits != nil && parser.limits.At.After(cota) {
-				cota = parser.limits.At
-				onLimits(parser.limits)
+			if limits := adapter.limits(); onLimits != nil && limits.At.After(cota) {
+				cota = limits.At
+				onLimits(limits)
 			}
 		})
 	}()
@@ -527,16 +535,26 @@ func (r *Runner) exec(ctx context.Context, step config.ResolvedAgent, prompt, wo
 		return "", Usage{}, context.Canceled
 	}
 	if err != nil {
+		if ae := adapter.err(); ae != nil && errBuf.String() == "" {
+			return "", adapter.usage(), fmt.Errorf("agent `%s` failed: %w", step.Command, ae)
+		}
 		msg := errBuf.String()
 		if msg == "" {
 			msg = err.Error()
 		}
-		return "", Usage{}, fmt.Errorf("agent `%s` failed: %s", step.Command, msg)
+		return "", adapter.usage(), agentFailure(step, msg)
 	}
-	if stream {
-		return parser.report(), parser.spend(), nil
+	if err := adapter.err(); err != nil {
+		return "", adapter.usage(), fmt.Errorf("agent `%s` failed: %w", step.Command, err)
 	}
-	return raw.String(), Usage{}, nil
+	return adapter.report(), adapter.usage(), nil
+}
+
+func agentFailure(step config.ResolvedAgent, message string) error {
+	if step.Format == "grok-stream" && strings.Contains(strings.ToLower(message), "max turns reached") {
+		return fmt.Errorf("Grok reached its configured turn limit before completing the review")
+	}
+	return fmt.Errorf("agent `%s` failed: %s", step.Command, message)
 }
 
 // eachLine chama fn para cada linha lida, sem limite de tamanho — um evento do

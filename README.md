@@ -218,6 +218,7 @@ The default args run the agent in stream mode:
 agent:
   command: claude
   args: [-p, --output-format, stream-json, --verbose, --allowedTools, "Read,Grep,Glob,Bash,Agent"]
+  format: claude-stream
 ```
 
 In that mode stdout is a stream of JSON events: Bazel turns each one into a
@@ -245,8 +246,10 @@ The log is a window over the last **500 lines** per review, held in memory. It
 does not travel over SSE: the page remembers where it stopped and fetches only
 what is missing, once a second. The agent's stderr is included, in another color.
 
-> If your `agent.args` is customized, Bazel leaves it alone — add
-> `--output-format stream-json --verbose` to get the translated log.
+`format` chooses how Bazel reads stdout: `claude-stream`, `codex-json`,
+`grok-stream`, or `plain`. Leaving it out preserves the old behavior: arguments that ask for
+Claude `stream-json` use the Claude adapter; all other commands use plain
+stdout. Set it explicitly for Codex and other structured CLIs.
 
 ## Token usage
 
@@ -285,8 +288,9 @@ saved markdown:
 - Spend: 1,8M tokens (in 12k · out 84k · cache 1,7M) · $2.41
 ```
 
-An agent that doesn't speak `stream-json` reports no spend, and the line simply
-doesn't appear.
+Plain agents report no spend. Codex JSON reports input, cached-input, and
+output tokens; it does not currently provide dollar cost or quota information.
+Grok Build's stream reports token usage and its final USD cost.
 
 ### Your Claude quota
 
@@ -394,6 +398,8 @@ skills_dir: ""    # empty = ~/.claude/skills
 agent:
   command: claude
   args: [-p, --output-format, stream-json, --verbose, --allowedTools, "Read,Grep,Glob,Bash,Agent"]
+  # Omit this to preserve legacy argument-based Claude detection.
+  format: claude-stream
   checkout: true          # clone the repo and check the PR out first
   timeout_seconds: 1800
   prompt: |-
@@ -417,9 +423,11 @@ post_agent:
 ### Agents and pipelines
 
 An agent only declares **what changes**: its `task` goes into the `{{task}}` of
-`agent.prompt`, and `command`, `args`, `checkout` and `timeout_seconds` are
-inherited from the `agent` block when left out. `prompt` replaces the whole
-template.
+`agent.prompt`, and `command`, `args`, `format`, `checkout` and
+`timeout_seconds` are inherited from the `agent` block when left out. `prompt`
+replaces the whole template. `env` is extra process environment for that agent.
+`args` inherit only with `command`; `format` inherits independently, so a custom
+command should set its own format when the base uses a structured adapter.
 
 ```yaml
 agents:
@@ -509,18 +517,65 @@ the template, the diff is never downloaded.
 
 Anything that reads a prompt on **stdin** and writes markdown to **stdout**
 works. With `checkout: true` it runs inside the PR clone, and whatever it writes
-goes to the [live log](#the-live-log) line by line.
+goes to the [live log](#the-live-log) line by line. Use `plain` when its stdout
+is the report itself; use a named format when it has a supported event stream.
 
 ```yaml
 # Claude Code on a specific model
 agent:
   command: claude
   args: ["-p", "--model", "claude-opus-5", "--allowedTools", "Read,Grep,Glob,Bash,Agent"]
+  format: claude-stream
 
 # Codex CLI
 agent:
   command: codex
-  args: ["exec", "-"]
+  args: ["exec", "--json", "--ephemeral", "--sandbox", "read-only", "-"]
+  format: codex-json
+
+# Grok Build. --prompt-file /dev/stdin lets Bazel provide its generated prompt.
+# Unlike `codex exec`, Grok headless still loads the user's interactive MCP,
+# plugins, and Claude skills. Bazel points GROK_HOME at a unique dir under
+# <BAZEL_HOME>/grok-runtime (auth is reused; MCP/plugins/skills are not)
+# unless the step sets GROK_HOME.
+agent:
+  command: grok
+  args: [--prompt-file, /dev/stdin, --output-format, streaming-json, --max-turns, "8", --no-subagents, --no-plan, --disable-web-search, --always-approve, --reasoning-effort, medium, --tools, "read_file,grep,list_dir,run_terminal_cmd"]
+  format: grok-stream
+  timeout_seconds: 300
+  env:
+    GROK_MCP_STARTUP_TIMEOUT_SECS: "2"
+
+# A selectable Codex review lens
+agents:
+  - name: codex-review
+    command: codex
+    args: ["exec", "--json", "--ephemeral", "--sandbox", "read-only", "-"]
+    format: codex-json
+    timeout_seconds: 600
+    task: >-
+      Review this PR for actionable correctness bugs. Diff {{base}}...HEAD once,
+      then inspect only changed files and their direct callers. Do not use the
+      network, GitHub APIs, CI, or the full test suite. Return the final Markdown
+      review after at most eight tool calls.
+  - name: grok-review
+    command: grok
+    args: [--prompt-file, /dev/stdin, --output-format, streaming-json, --max-turns, "8", --no-subagents, --no-plan, --disable-web-search, --always-approve, --reasoning-effort, medium, --tools, "read_file,grep,list_dir,run_terminal_cmd"]
+    format: grok-stream
+    timeout_seconds: 300
+    env:
+      GROK_MCP_STARTUP_TIMEOUT_SECS: "2"
+    task: >-
+      Review this PR for actionable correctness bugs. Diff {{base}}...HEAD once,
+      read only those files, then write the Markdown review.
+  # Pi against a local OpenAI-compatible server (llama.cpp, Ollama, …).
+  # Point the model at ~/.pi/agent/models.json. stdout is the report (`plain`);
+  # a JSONL live-log adapter is tracked separately.
+  - name: pi-review
+    command: pi
+    args: [-p, --no-session, --tools, "read,grep,find,ls"]
+    format: plain
+    task: Review this PR for actionable correctness bugs.
 ```
 
 > `claude -p` denies every permission that isn't granted, silently. That is why

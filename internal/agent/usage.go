@@ -10,12 +10,17 @@ import (
 // stream-json, que já soma os sub-agentes que ele tiver disparado — um
 // executável que não fala esse formato devolve tudo zerado, e a interface
 // simplesmente não mostra gasto nenhum.
+//
+// Model é o nome do modelo principal que rodou. É o que a tabela de preços
+// usa para calcular o custo: um modelo desconhecido cai em tokens-only, sem
+// tentar adivinhar um número que pode enganar.
 type Usage struct {
 	InputTokens  int     `json:"input_tokens,omitempty"`
 	OutputTokens int     `json:"output_tokens,omitempty"`
 	CacheWrite   int     `json:"cache_write_tokens,omitempty"`
 	CacheRead    int     `json:"cache_read_tokens,omitempty"`
 	CostUSD      float64 `json:"cost_usd,omitempty"`
+	Model        string  `json:"model,omitempty"`
 }
 
 // Total é tudo que passou pelo modelo. O cache entra na conta: lido ou
